@@ -1,4 +1,4 @@
-"""Built-in Pico skills."""
+"""Built-in jarvis skills."""
 
 from __future__ import annotations
 

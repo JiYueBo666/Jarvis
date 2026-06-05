@@ -9,7 +9,7 @@ from rich import json
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 IGNORED_PATH_NAMES = {
     ".git",
-    ".pico",
+    ".jarvis",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",

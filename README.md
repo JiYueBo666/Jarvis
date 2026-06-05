@@ -26,4 +26,4 @@
 python main.py
 ```
 
-进入 `pico>` 交互式终端，输入自然语言指令即可。支持 `/exit`、`/memory`、`/session`、`/reset` 等快捷命令。
+进入 `Jarvis>` 交互式终端，输入自然语言指令即可。支持 `/exit`、`/memory`、`/session`、`/reset` 等快捷命令。

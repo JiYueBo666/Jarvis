@@ -6,7 +6,7 @@ from typing import Callable
 
 # 匹配并提取 Markdown 文件最顶部的 --- 包裹的 YAML Front Matter 内容
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
-SKILL_FILE_CREATION_GUIDE = """When creating Pico skill files at .pico/skills/<name>/SKILL.md or skills/<name>/SKILL.md, use frontmatter:
+SKILL_FILE_CREATION_GUIDE = """When creating Jarvis skill files at .jarvis/skills/<name>/SKILL.md or skills/<name>/SKILL.md, use frontmatter:
 ---
 name: audit
 description: Audit a file

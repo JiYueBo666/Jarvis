@@ -11,6 +11,7 @@ class ApprovalPolicy(str, Enum):
     auto = "auto"
     never = "never"
 
+
 from src.Agent.model import OpenAICompatibleModelClient
 from src.Environment.workSpace import WorkSpaceContext
 from src.Runtime.runtime import Jarvis, SessionStore, SessionStore
@@ -18,15 +19,15 @@ from src.config import settings
 
 app = typer.Typer()
 DEFAULT_SECRET_ENV_NAMES = (
-    "PICO_OPENAI_API_KEY",
+    "Jarvis_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
-    "PICO_ANTHROPIC_API_KEY",
+    "Jarvis_ANTHROPIC_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
-    "PICO_DEEPSEEK_API_KEY",
+    "Jarvis_DEEPSEEK_API_KEY",
     "DEEPSEEK_API_KEY",
-    "PICO_RIGHT_CODES_API_KEY",
+    "Jarvis_RIGHT_CODES_API_KEY",
     "RIGHT_CODES_API_KEY",
     "GITHUB_PAT",
     "GH_PAT",
@@ -92,7 +93,9 @@ def start(
         "max_steps": max_steps,
         "max_new_tokens": max_new_tokens,
         "resume": resume,
-        "approval": approval.value if isinstance(approval, ApprovalPolicy) else approval,
+        "approval": (
+            approval.value if isinstance(approval, ApprovalPolicy) else approval
+        ),
         "cwd": cwd,
     }
     agent = build_agent(args)
@@ -101,7 +104,7 @@ def start(
 
     while True:
         try:
-            user_input = input("\npico> ").strip()
+            user_input = input("\njarvis> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0

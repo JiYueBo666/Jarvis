@@ -91,7 +91,7 @@ _PLAN_DIR_MARKER = "/.jarvis/plans/"
 def _plan_path(topic, path=None):
     if path:
         value = str(path).strip()
-        # 模型有时给绝对路径，如 /Users/u/repo/.pico/plans/foo；自动把它相对化。
+        # 模型有时给绝对路径，如 /Users/u/repo/.jarvis/plans/foo；自动把它相对化。
         if value.startswith("/") and _PLAN_DIR_MARKER in value:
             value = value[value.index(_PLAN_DIR_MARKER) + 1 :]
         if value.startswith("./"):
@@ -103,5 +103,5 @@ def _plan_path(topic, path=None):
         or value.endswith("/")
         or ".." in value.split("/")
     ):
-        raise ValueError("plan path must stay under .pico/plans/")
+        raise ValueError("plan path must stay under .jarvis/plans/")
     return value

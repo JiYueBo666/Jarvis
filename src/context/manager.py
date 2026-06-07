@@ -13,7 +13,9 @@ def _build_resume_block(state: dict) -> str:
     if state.get("completed_goals"):
         lines.append(f"已完成: {', '.join(state['completed_goals'])}")
     if state.get("last_tool"):
-        lines.append(f"最后工具: {state['last_tool']}（步数 {state.get('tool_steps', 0)}）")
+        lines.append(
+            f"最后工具: {state['last_tool']}（步数 {state.get('tool_steps', 0)}）"
+        )
     touched = state.get("touched_files", [])
     if touched:
         lines.append(f"接触文件: {', '.join(f['path'] for f in touched)}")
@@ -83,7 +85,11 @@ class ContextManager:
         system = self._system_prompt()
         resume_note = _build_resume_block(last_state)
         self._messages = [
-            {"role": "system", "content": f"{system}\n\n{resume_note}", **self._cache_tag()},
+            {
+                "role": "system",
+                "content": f"{system}\n\n{resume_note}",
+                **self._cache_tag(),
+            },
             {"role": "user", "content": query},
         ]
 
@@ -112,17 +118,19 @@ class ContextManager:
         self._messages.append(msg)
 
     def append_tool_result(self, tool_call_id: str, content: str):
-        self._messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": content,
-        })
+        self._messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+        )
 
     # ── internals ────────────────────────────────────────────────
 
     def _system_prompt(self) -> str:
         return (
-            "You are jarvis, a small local coding agent.\n"
+            "You are Jarvis, Tony Stark's super AI assistant. You are now helping Tony write code..\n"
             "Use the available tools to read, write, and modify files.\n"
             "When the task is complete, return a final answer in natural language.\n"
             "Never invent tool results.\n"

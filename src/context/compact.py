@@ -1,10 +1,11 @@
 import json
 
-HISTORY_BUDGET = 3000
-KEEP_LAST_N = 2  # keep last N messages intact when compacting
+# DeepSeek V4 Flash 上下文窗口 1M tokens，按 ~4 chars/tok 估算
+DEFAULT_HISTORY_BUDGET = 50000  # 字符
+KEEP_LAST_N = 2  # 保留最近 N 条原始消息
 
 
-def compact_history(history: list[dict], budget: int = HISTORY_BUDGET) -> list[dict]:
+def compact_history(history: list[dict], budget: int = DEFAULT_HISTORY_BUDGET) -> list[dict]:
     """
     尝试将对话历史压缩到指定字符预算内。
 

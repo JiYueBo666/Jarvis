@@ -2,76 +2,22 @@
 
 一个本地终端编程智能体，通过自然语言与 LLM 交互，自动完成代码的阅读、搜索、编辑和执行。
 
-## 架构概览
-
-项目经过 v4 重构，采用清晰的分层架构，依赖方向严格向下：
-
-```
-                    cli.py / tui/
-                         │
-                     agent.py  ← 组合根
-                    /   |   \   \
-                   /    |    \   \
-          engine/  context/  guard/  life/  trace/
-           /  \       \       /      /      /
-          /    \       \     /      /      /
-    memory/  tools/  skills/  workers/  providers/
-          \     \       \     /        /
-           \     \       \   /        /
-            └─────┴───┴───┴─────────┘
-                      │
-                    data/    ← 被所有层依赖
-```
-
-### 分层说明
-
-| 层 | 职责 |
-|---|------|
-| **agent.py** | 极薄组合根（<100 行），组装所有子系统 |
-| **engine/** | 唯一编排点，Model I/O、工具执行、turn 生命周期 |
-| **guard/** | 安全门链：权限、策略、Profile、重复调用拦截、沙箱 |
-| **context/** | 上下文装配与历史压缩，控制 prompt 预算 |
-| **memory/** | 工作记忆与持久化长期记忆 |
-| **life/** | 检查点、会话恢复、Plan 模式控制器 |
-| **trace/** | 可观测基建：事件总线、Span、审计报告 |
-| **data/** | 纯 dataclass，零业务逻辑，被所有层依赖 |
-| **tools/** | 内置工具实现 |
-| **providers/** | LLM Provider 适配层 |
-
-## 核心特性
-
-**6 个内置工具** — 文件读写（`read_file` / `write_file` / `patch_file`）、基于 Shell 的代码搜索与执行（`run_shell`）。
-
-**多层安全防护** — 工具权限分级（多种 profile）、重复调用拦截（`guard/repetition.py`）、五级安全门链。
-
-**工作记忆与持久记忆** — 跨轮次的紧凑工作记忆（任务摘要、最近文件、事件笔记）；基于主题的持久化长期记忆（`memory/` 层）。
-
-**上下文窗口管理** — 自动将 prompt 控制在预算范围内，按优先级压缩各分区；历史对话智能压缩（`context/compact.py`）。
-
-**会话与检查点** — 会话事件持久化为 JSONL；检查点记录运行身份与关键文件新鲜度，支持安全恢复会话（`life/` 层）。
-
-**子智能体系统** — 可在后台线程中派生 Worker 子智能体，支持消息传递与中止控制（`workers/` 层）。
-
-**技能系统** — 从内置定义和 `.jarvis/skills/` 目录自动发现技能（`skills/` 层）。
-
-**Plan 模式** — 进入后智能体仅可读取文件和撰写计划文档，适合先规划再执行的工作流（`life/plan.py`）。
-
-**可观测性** — 完整的 trace 事件流（`trace/` 层），支持审计、Span 追踪、运行报告生成。
-
 ## 快速开始
 
-### 1. 配置环境变量
+### 1. 配置
 
 创建 `.env` 文件（参考 `.env.example`）：
 
 ```ini
-API_KEY=your_api_key_here
-BASE_URL=https://api.openai.com/v1
-SPEED_MODEL=gpt-4o-mini
-HIGH_MODEL=gpt-4o
+API_KEY=sk-your_key_here
+BASE_URL=https://api.deepseek.com/v1
+SPEED_MODEL=deepseek-chat
+HIGH_MODEL=deepseek-chat
 ```
 
-### 2. 安装依赖
+支持任何 OpenAI 兼容 API：DeepSeek、OpenAI、通义千问、GLM 等。
+
+### 2. 安装
 
 ```bash
 pip install -e .
@@ -83,86 +29,97 @@ pip install -e .
 python main.py
 ```
 
-进入 `jarvis>` 交互式终端，输入自然语言指令即可。
+进入 `jarvis>` 交互式终端，直接输入需求即可。
+
+### 4. 使用示例
+
+```
+jarvis> 列出当前目录下有多少个 Python 文件
+
+  ── 模型调用 1 ──
+  🧠 先看看目录结构...
+  run_shell(command=find . -name "*.py" | wc -l)
+  → 2339
+  ├─ 输入 1438 tok | 输出  281 tok | 缓存 1408 tok (98%) | 费用 $0.0064
+
+jarvis> 读取 src/engine/loop.py 的前 10 行
+
+  ── 模型调用 1 ──
+  read_file(path=src/engine/loop.py, start=1, end=10)
+  → import time
+    from src.context.manager import ContextManager
+    ...
+```
 
 ### 内置命令
 
 | 命令 | 说明 |
-|------|------|
+|---|---|
 | `/exit` / `/quit` | 退出 |
 | `/session` | 查看当前会话信息 |
+| `/sessions` | 列出所有本地会话 |
+| `/resume` | 恢复上一个会话 |
 | `/help` | 查看帮助 |
 
-## 开发
+### 启动选项
 
-### 项目结构
-
-```
-src/
-├── agent.py              # 组合根（依赖注入）
-├── cli.py                # REPL 入口（prompt_toolkit）
-├── config.py             # 配置（pydantic-settings）
-├── testing.py            # 测试工具
-├── data/                 # 纯数据结构（dataclass）
-│   ├── session.py
-│   ├── memory.py
-│   ├── task.py
-│   ├── checkpoint.py
-│   ├── trace.py
-│   ├── identity.py
-│   └── events.py
-├── engine/               # 引擎层
-│   ├── loop.py           # 主循环（唯一编排点）
-│   ├── model.py          # 模型调用与输出解析
-│   ├── tool.py           # 工具执行（纯函数）
-│   └── executor.py       # ToolExecutor
-├── guard/                # 安全约束
-│   ├── permissions.py
-│   ├── policy.py
-│   ├── profiles.py
-│   ├── repetition.py
-│   └── sandbox/
-├── context/              # 上下文治理
-│   ├── manager.py
-│   ├── compact.py
-│   └── render.py
-├── memory/               # 记忆系统
-│   ├── store.py
-│   ├── fresh.py
-│   ├── recall.py
-│   └── durable.py
-├── life/                 # 生命周期
-│   ├── checkpoint.py
-│   ├── resume.py
-│   └── plan.py
-├── trace/                # 可观测基建
-│   ├── bus.py
-│   ├── span.py
-│   ├── store.py
-│   ├── consumers.py
-│   └── report.py
-├── tools/                # 内置工具
-│   ├── base.py
-│   ├── read_file.py
-│   ├── write_file.py
-│   ├── patch_file.py
-│   └── run_shell.py
-├── providers/            # LLM Provider
-│   ├── base.py
-│   ├── clients.py
-│   └── errors.py
-├── skills/               # 技能系统
-│   ├── bundled.py
-│   ├── discovery.py
-│   └── runtime.py
-├── workers/              # 子智能体
-│   ├── executor.py
-│   ├── manager.py
-│   └── runtime.py
-└── tui/                  # TUI 界面
+```bash
+python main.py              # 新建会话，ask 审批
+python main.py auto         # 自动审批所有危险操作
+python main.py never        # 拒绝所有危险操作
+python main.py --resume     # 启动后自动恢复上一个会话
 ```
 
-### 依赖
+## 工具
+
+| 工具 | 说明 | 安全等级 |
+|---|---|---|
+| `read_file` | 读取文件，支持行号范围 | 安全 |
+| `write_file` | 创建或覆盖文件 | 危险 |
+| `patch_file` | 精确替换第一个匹配文本（非正则） | 危险 |
+| `run_shell` | 在工作目录执行 Shell 命令 | 危险 |
+
+危险工具在 `ask` 审批模式下会向用户确认。
+
+## 特性
+
+- **工具调用** — 基于 OpenAI function calling 的原生工具执行
+- **实时进度** — 模型思考 `🧠`、工具调用、结果输出逐步显示
+- **Token 统计** — 每轮结束后显示输入/输出/cache 用量和估算费用
+- **提示词缓存** — 自动标记稳定部分（系统提示、工具定义）为 cache_control
+- **会话持久化** — 事件流水、运行记录自动写入 `.jarvis/sessions/`
+- **历史压缩** — 跨轮对话超预算时自动压缩为结构化摘要
+- **重复检测** — 相同工具+参数连续调用 / 写失败后未读文件即重试，自动拦截
+- **模型重试** — 可恢复错误（限速、超时、5xx）自动回退重试
+- **会话恢复** — 进程崩溃后通过 `/resume` 恢复上下文继续工作
+- **审批控制** — 危险工具支持 ask/auto/never 三种策略
+
+## 项目状态
+
+项目处于可用状态。核心路径（模型调用 → 工具执行 → 结果返回 → 持久化）已打通。
+
+### 已实现
+
+`engine/` — 编排循环、模型客户端、工具执行器、重复检测、审批  
+`context/` — 消息管理、跨轮历史、预算压缩、缓存标记  
+`tools/` — 读文件、写文件、补丁、Shell  
+`trace/` — 事件总线、JSONL 持久化、TaskState 记录  
+`guard/` — 重复调用检测  
+`data/` — TaskState、TouchedFile  
+`cli/` — prompt_toolkit REPL、流式渲染、Token 统计、Spinner
+
+### 空目录（规划中）
+
+| 目录 | 预期内容 |
+|---|---|
+| `memory/` | 工作记忆、文件摘要、episodic notes、持久记忆 |
+| `guard/permissions.py` | 权限校验、策略检查 |
+| `guard/sandbox/` | Shell 沙箱隔离 |
+| `life/` | 检查点、Plan 模式 |
+| `skills/` | 技能系统 |
+| `workers/` | 子智能体管理 |
+
+## 依赖
 
 - Python >= 3.11
 - openai >= 2.38.0
@@ -170,4 +127,21 @@ src/
 - pydantic-settings >= 2.14.1
 - prompt-toolkit >= 3.0.52
 - rich >= 15.0.0
-- typer >= 0.26.4
+
+## 架构
+
+```
+                    cli.py
+                       │
+                    agent.py    ← 组合根
+                   /    |   \
+            engine/  context/  trace/  tools/
+               │        │        │       │
+               ├ loop.py  manager.py  bus.py  read_file.py
+               ├ model.py compact.py  store.py write_file.py
+               ├ executor.py          │    patch_file.py
+               └ tool.py              │    run_shell.py
+                                      └ data/task.py
+```
+
+详见 [note.md](note.md) 中的完整架构设计说明。

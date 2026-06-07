@@ -38,6 +38,27 @@ class RunStore:
             f.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
         return path
 
+    # ── session 元数据 ──────────────────────────────────────
+
+    def save_session_meta(self, data: dict) -> Path:
+        path = self.session_dir / "session.json"
+        self._write_json_atomic(path, data)
+        return path
+
+    def load_session_meta(self) -> dict | None:
+        path = self.session_dir / "session.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def last_unfinished_task(self) -> dict | None:
+        """返回最后一个状态为 running 的 task_state，用于恢复。"""
+        for task_id in reversed(self.list_turns()):
+            state = self.load_task_state(task_id)
+            if state and state.get("status") == "running":
+                return state
+        return None
+
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict):
         path.parent.mkdir(parents=True, exist_ok=True)

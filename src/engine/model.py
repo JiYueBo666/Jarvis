@@ -32,17 +32,8 @@ class ModelClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        extra_headers = {}
-        if kwargs.get("prompt_cache_key"):
-            extra_headers["x-prompt-cache-key"] = kwargs["prompt_cache_key"]
-        if kwargs.get("prompt_cache_retention"):
-            extra_headers["x-prompt-cache-retention"] = kwargs["prompt_cache_retention"]
-
         try:
-            response = self.client.chat.completions.create(
-                **body,
-                extra_headers=extra_headers or None,
-            )
+            response = self.client.chat.completions.create(**body)
         except Exception as exc:
             raise _to_provider_error(exc, self.model, self.base_url)
 
@@ -65,11 +56,19 @@ class ModelClient:
                     "args": args,
                 })
 
+        usage = response.usage
+        cached_tokens = 0
+        if usage:
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details:
+                cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
         self.last_completion_metadata = {
             "model": self.model,
-            "usage": dict(response.usage or {}),
+            "usage": dict(usage or {}),
             "finish_reason": choice.finish_reason or "",
             "tool_calls_count": len(tool_calls) if tool_calls else 0,
+            "cached_tokens": cached_tokens,
         }
         return ModelResult(
             text=text,

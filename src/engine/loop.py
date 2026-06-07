@@ -33,13 +33,14 @@ class Engine:
         *,
         max_steps: int = 100,
         max_tool_steps: int = 100,
+        max_new_tokens: int = 8192,
         approval_policy: str = "auto",
     ) -> str:
         """执行一轮对话，返回最终答案（非流式便利方法）。"""
         for event in Engine.run_stream(
             model_client, executor, ctx, bus, query,
             max_steps=max_steps, max_tool_steps=max_tool_steps,
-            approval_policy=approval_policy,
+            max_new_tokens=max_new_tokens, approval_policy=approval_policy,
         ):
             if event["type"] in ("final", "step_limit", "error"):
                 return event.get("text") or event.get("message") or "(no answer)"
@@ -55,6 +56,7 @@ class Engine:
         *,
         max_steps: int = 100,
         max_tool_steps: int = 100,
+        max_new_tokens: int = 8192,
         approval_policy: str = "auto",
     ):
         """流式编排核心，yield 进度事件供上层渲染。
@@ -75,7 +77,7 @@ class Engine:
                 try:
                     return complete_model(
                         model_client, ctx.messages,
-                        max_new_tokens=4096, tools=executor.schemas,
+                        max_new_tokens=max_new_tokens, tools=executor.schemas,
                     )
                 except ProviderError as exc:
                     last_error = exc

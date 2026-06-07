@@ -77,6 +77,138 @@ class ModelClient:
             metadata=dict(self.last_completion_metadata),
         )
 
+    def stream_complete(
+        self,
+        messages: list,
+        max_new_tokens: int,
+        tools: list | None = None,
+        **kwargs,
+    ):
+        """Stream the model completion, yielding reasoning chunks in real-time.
+
+        Yields:
+            {"type": "reasoning", "content": str}  — a chunk of reasoning text
+            {"type": "result",   "result": ModelResult}  — final result (last event)
+        """
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_new_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+
+        try:
+            response = self.client.chat.completions.create(**body)
+        except Exception as exc:
+            raise _to_provider_error(exc, self.model, self.base_url)
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_map: dict[int, dict] = {}
+        finish_reason = ""
+        usage = None
+
+        for chunk in response:
+            if not chunk.choices:
+                # May contain usage info in the final chunk
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = chunk.usage
+                continue
+
+            delta = chunk.choices[0].delta
+            if not delta:
+                continue
+
+            # ── Stream reasoning content ──
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                yield {"type": "reasoning", "content": reasoning}
+
+            # ── Accumulate content ──
+            if delta.content:
+                text_parts.append(delta.content)
+
+            # ── Accumulate tool calls ──
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_map:
+                        tool_calls_map[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                    if tc.id:
+                        tool_calls_map[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_map[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_map[idx]["function"]["arguments"] += tc.function.arguments
+
+            # Track finish_reason from the last chunk
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+        # ── Build final result ──
+        text = "".join(text_parts).strip()
+        reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
+
+        tool_calls = None
+        if tool_calls_map:
+            tool_calls = []
+            for idx in sorted(tool_calls_map.keys()):
+                tc = tool_calls_map[idx]
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append({
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "args": args,
+                })
+
+        # ── 用量数据：流式可能不返回 → 回退非流式探针 ──
+        if not usage or not getattr(usage, "prompt_tokens", None):
+            try:
+                probe = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=1,
+                    tools=tools,
+                    stream=False,
+                )
+                usage = probe.usage
+            except Exception:
+                usage = None
+
+        cached_tokens = 0
+        if usage:
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details:
+                cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
+        metadata = {
+            "model": self.model,
+            "usage": dict(usage or {}),
+            "finish_reason": finish_reason,
+            "tool_calls_count": len(tool_calls) if tool_calls else 0,
+            "cached_tokens": cached_tokens,
+        }
+        self.last_completion_metadata = metadata
+
+        yield {
+            "type": "result",
+            "result": ModelResult(
+                text=text,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                metadata=dict(metadata),
+            ),
+        }
+
 
 def _to_provider_error(exc: Exception, model: str, base_url: str) -> ProviderError:
     """Map OpenAI SDK exceptions to ProviderError."""

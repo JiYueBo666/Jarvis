@@ -1,8 +1,9 @@
-import subprocess
 from pathlib import Path
 from typing import Any
 
+from src.config import settings
 from src.engine.tool import Tool, ToolParameter
+from src.guard.sandbox import SandboxConfig, SandboxMode, SandboxRunner
 from src.tools.base import ToolResult
 
 
@@ -19,6 +20,15 @@ class RunShell(Tool):
         )
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else Path.cwd()
 
+        # ── 初始化沙箱执行器 ────────────────────────────────────
+        sandbox_mode = SandboxMode(settings.SANDBOX_MODE)
+        self._sandbox = SandboxRunner(
+            SandboxConfig(
+                mode=sandbox_mode,
+                workspace_root=str(self.workspace_root),
+            )
+        )
+
     def get_parameters(self) -> list[ToolParameter]:
         return [
             ToolParameter(name="command", type="string", description="Shell command to execute"),
@@ -34,33 +44,5 @@ class RunShell(Tool):
         command = str(parameters["command"])
         timeout = int(parameters.get("timeout", 30))
 
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(self.workspace_root),
-            )
-            output_parts = []
-            if result.stdout:
-                output_parts.append(result.stdout.strip())
-            if result.stderr:
-                output_parts.append(f"[stderr]\n{result.stderr.strip()}")
-            output = "\n".join(output_parts) if output_parts else "(no output)"
-            if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
-
-            return ToolResult(
-                output=output,
-                metadata={"exit_code": result.returncode},
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                output=f"Command timed out after {timeout}s: {command[:200]}",
-            )
-        except OSError as e:
-            return ToolResult(
-                output=f"Error running command: {e}",
-            )
+        # 委托给沙箱执行器
+        return self._sandbox.run(command, timeout=timeout)

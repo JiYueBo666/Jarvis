@@ -1,11 +1,6 @@
-from dataclasses import dataclass, field
 from pathlib import Path
 
-
-@dataclass
-class ToolResult:
-    output: str
-    metadata: dict = field(default_factory=dict)
+from src.result import ToolResult  # noqa: F401 — re-export
 
 
 def resolve_path(path: str, workspace_root: Path | None = None) -> Path:

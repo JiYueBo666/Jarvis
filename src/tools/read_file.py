@@ -56,4 +56,7 @@ class ReadFile(Tool):
 
         line_offset = start or 1
         numbered = [f"{line_offset + i:6d} | {line}" for i, line in enumerate(lines)]
-        return ToolResult(output="".join(numbered))
+        return ToolResult(
+            output="".join(numbered),
+            metadata={"affected_paths": [str(path)]},
+        )

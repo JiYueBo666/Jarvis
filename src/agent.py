@@ -29,13 +29,20 @@ class Agent:
         prompt_caching: bool = True,
         max_new_tokens: int = 8192,
         history_budget: int = 50000,
+        context_window: int = 1_000_000,
     ):
         self.workspace_root = workspace_root or os.getcwd()
         self.approval_policy = approval_policy
         self.prompt_caching = prompt_caching
         self.max_new_tokens = max_new_tokens
         self.history_budget = history_budget
+        self.context_window = context_window
         self._resume_state: dict | None = None
+        # ── Plan Mode ──────────────────────────────────────────────
+        self.mode: str = "default"
+        self.topic: str = ""
+        self.plan_path: str = ""
+        self._pending_plan: str | None = None  # 等待注入的计划内容
 
         if session_dir:
             self._load_existing_session(session_dir)
@@ -55,6 +62,12 @@ class Agent:
             prompt_caching=prompt_caching,
             history_budget=history_budget,
         )
+        # 从持久化存储恢复跨轮对话历史
+        if session_dir:
+            persisted = self.store.load_history()
+            if persisted:
+                self.ctx.restore_history(persisted)
+
         if self._resume_state:
             self.ctx.preview_resume(self._resume_state)
 
@@ -126,6 +139,7 @@ class Agent:
         副作用：
         - 写 per-turn trace.jsonl
         - 渐进更新 task_state.json
+        - 跨轮历史持久化到 history.jsonl
         """
         # 判断是否需要恢复
         if self._resume_state:
@@ -134,28 +148,38 @@ class Agent:
         else:
             self.ctx.start_turn(query)
 
+        # ── 注入待执行的计划内容（/execute 后使用） ──
+        if self._pending_plan:
+            self.ctx.inject_plan(self._pending_plan)
+            self._pending_plan = None
+
         task_id = None
-        for event in Engine.run_stream(
-            self.model_client,
-            self.executor,
-            self.ctx,
-            self.bus,
-            query,
-            max_new_tokens=self.max_new_tokens,
-            approval_policy=self.approval_policy,
-        ):
-            # 提取 task_id
-            if not task_id:
-                task_id = event.get("task_id", "")
-            if not task_id and "record" in event:
-                task_id = event["record"].get("task_id", "")
+        try:
+            for event in Engine.run_stream(
+                self.model_client,
+                self.executor,
+                self.ctx,
+                self.bus,
+                query,
+                max_new_tokens=self.max_new_tokens,
+                approval_policy=self.approval_policy,
+                mode=self.mode,
+            ):
+                # 提取 task_id
+                if not task_id:
+                    task_id = event.get("task_id", "")
+                if not task_id and "record" in event:
+                    task_id = event["record"].get("task_id", "")
 
-            # 写 trace.jsonl
-            if task_id and event["type"] != "record":
-                self.store.append_trace(task_id, event)
+                # 写 trace.jsonl
+                if task_id and event["type"] != "record":
+                    self.store.append_trace(task_id, event)
 
-            # 渐进保存 task_state.json
-            if "record" in event:
-                self.store.save_task_state(event["record"]["task_id"], event["record"])
+                # 渐进保存 task_state.json
+                if "record" in event:
+                    self.store.save_task_state(event["record"]["task_id"], event["record"])
 
-            yield event
+                yield event
+        finally:
+            # 轮次结束后持久化跨轮历史（含本轮移入的消息）
+            self.store.save_history(self.ctx.history)

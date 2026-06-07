@@ -38,7 +38,39 @@ class ToolExecutor:
         """OpenAI-compatible tool schemas for the model."""
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    def execute(self, name: str, args: dict[str, Any]) -> ExecutionResult:
+    def allowed_tools(self, mode: str) -> set[str]:
+        """根据 mode 返回当前可用的工具名集合。
+
+        | mode     | 白名单                                                |
+        |----------|-------------------------------------------------------|
+        | default  | 全部工具                                              |
+        | plan     | read_file + write_file（仅限 .jarvis/plans/* 路径）   |
+        """
+        if mode == "plan":
+            return {"read_file", "write_file"}
+        return set(self._tools.keys())
+
+    def execute(self, name: str, args: dict[str, Any], mode: str = "default") -> ExecutionResult:
+        # ── Mode 过滤（策略级限制，不走审批流程） ──
+        allowed = self.allowed_tools(mode)
+        if name not in allowed:
+            return ExecutionResult(
+                success=False,
+                output=f"Error: tool '{name}' is not allowed in {mode} mode",
+                tool_name=name,
+                error_code="mode_denied",
+            )
+        # Plan mode 下 write_file 仅允许写入 .jarvis/plans/ 目录
+        if mode == "plan" and name == "write_file":
+            path = args.get("path", "")
+            if not path.startswith(".jarvis/plans/"):
+                return ExecutionResult(
+                    success=False,
+                    output=f"Error: write_file is only allowed for .jarvis/plans/ paths in plan mode",
+                    tool_name=name,
+                    error_code="mode_denied",
+                )
+
         # 存在性检测.
         tool = self._tools.get(name)
         if not tool:

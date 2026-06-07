@@ -3,6 +3,9 @@ import tempfile
 from pathlib import Path
 
 
+HISTORY_FILENAME = "history.jsonl"
+
+
 class RunStore:
     """Persists per-turn records (TaskState) to disk."""
 
@@ -50,6 +53,31 @@ class RunStore:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
+
+    # ── 跨轮历史持久化 ──────────────────────────────────
+
+    def save_history(self, messages: list[dict]) -> Path:
+        """将跨轮对话历史持久化到 session 级别的 history.jsonl。
+
+        messages 是 ContextManager._history 的内容，
+        包含之前所有轮次的 user / assistant / tool 消息。
+        """
+        path = self.session_dir / HISTORY_FILENAME
+        with path.open("w", encoding="utf-8") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return path
+
+    def load_history(self) -> list[dict]:
+        """加载之前持久化的跨轮对话历史。"""
+        path = self.session_dir / HISTORY_FILENAME
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     def last_unfinished_task(self) -> dict | None:
         """返回最后一个状态为 running 的 task_state，用于恢复。"""

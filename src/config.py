@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     SPEED_MODEL: str
     HIGH_MODEL: str
 
+    # ── Sandbox ──────────────────────────────────────────────────
+    SANDBOX_MODE: str = "best_effort"  # off / best_effort / required
+
     model_config = SettingsConfigDict(
         env_file=".env",  # 从 .env 读取
         env_file_encoding="utf-8",

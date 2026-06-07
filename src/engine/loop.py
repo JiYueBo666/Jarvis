@@ -5,7 +5,6 @@ from src.data.task import TaskState
 from src.engine.executor import ToolExecutor
 from src.engine.model import ModelClient
 from src.guard.repetition import RepetitionDetector
-from src.providers.base import complete_model
 from src.providers.errors import ProviderError
 from src.trace.bus import SessionEventBus
 
@@ -35,12 +34,14 @@ class Engine:
         max_tool_steps: int = 100,
         max_new_tokens: int = 8192,
         approval_policy: str = "auto",
+        mode: str = "default",
     ) -> str:
         """执行一轮对话，返回最终答案（非流式便利方法）。"""
         for event in Engine.run_stream(
             model_client, executor, ctx, bus, query,
             max_steps=max_steps, max_tool_steps=max_tool_steps,
             max_new_tokens=max_new_tokens, approval_policy=approval_policy,
+            mode=mode,
         ):
             if event["type"] in ("final", "step_limit", "error"):
                 return event.get("text") or event.get("message") or "(no answer)"
@@ -58,27 +59,50 @@ class Engine:
         max_tool_steps: int = 100,
         max_new_tokens: int = 8192,
         approval_policy: str = "auto",
+        mode: str = "default",
     ):
         """流式编排核心，yield 进度事件供上层渲染。
 
         事件类型: model_requested, reasoning, tool_call, tool_result, final, step_limit, error
         """
         ctx.start_turn(query)
+        # ── Plan Mode：注入计划模式约束到系统提示 ──
+        if mode == "plan":
+            plan_constraints = (
+                "\n\n[PLAN MODE]\n"
+                "You are in PLAN MODE. Follow these rules:\n"
+                "1. ONLY read files and write plan documents — DO NOT modify source code.\n"
+                "2. You may write the plan ONLY to paths under .jarvis/plans/.\n"
+                "3. DO NOT execute shell commands or use any other tools.\n"
+                "4. Focus on analyzing the current codebase and producing a detailed plan.\n"
+                "5. When the plan is complete, return a final answer with a summary."
+            )
+            if ctx.messages and ctx.messages[0].get("role") == "system":
+                ctx.messages[0]["content"] += plan_constraints
+
         record = TaskState.create(query)
         model_call_count = 0
         tool_call_count = 0
         detector = RepetitionDetector()
         bus.emit(EV_TURN_STARTED, {"task_id": record.task_id, "query": query})
 
-        def _call_with_retry():
-            """调模型，遇可重试错误按线性退避重试。"""
+        def _call_stream_with_retry():
+            """流式调模型，逐块产出 reasoning，遇可重试错误退避重试。
+
+            Yields:
+                {"type": "reasoning", "content": str}  — 推理内容块
+                {"type": "result",    "result": ModelResult}  — 最终结果
+                {"type": "error",     "message": str}  — 不可恢复的错误
+            """
             last_error = None
             for attempt in range(MAX_PROVIDER_RETRIES + 1):
                 try:
-                    return complete_model(
-                        model_client, ctx.messages,
-                        max_new_tokens=max_new_tokens, tools=executor.schemas,
+                    yield from model_client.stream_complete(
+                        ctx.messages,
+                        max_new_tokens=max_new_tokens,
+                        tools=executor.schemas,
                     )
+                    return  # 成功结束
                 except ProviderError as exc:
                     last_error = exc
                     if not exc.retryable or attempt >= MAX_PROVIDER_RETRIES:
@@ -87,10 +111,14 @@ class Engine:
                 except Exception as exc:
                     last_error = exc
                     break
-            return _user_facing_error(last_error)
+            yield {"type": "error", "message": _user_facing_error(last_error)}
 
         try:
             while model_call_count < max_steps and tool_call_count < max_tool_steps:
+                # ── 文件变更检测（仅在首次调用后有追踪文件时生效） ──
+                if ctx.check_file_changes():
+                    ctx.rebuild_system_prompt()
+
                 # ── 请求模型 ──
                 bus.emit(EV_MODEL_REQUESTED, {
                     "task_id": record.task_id, "model_call_seq": model_call_count + 1,
@@ -101,17 +129,23 @@ class Engine:
                     "task_id": record.task_id,
                 }
 
-                result = _call_with_retry()
-                if isinstance(result, str):
-                    yield {"type": "error", "message": result}
+                result = None
+                for stream_chunk in _call_stream_with_retry():
+                    if stream_chunk["type"] == "reasoning":
+                        yield {"type": "reasoning", "content": stream_chunk["content"]}
+                    elif stream_chunk["type"] == "result":
+                        result = stream_chunk["result"]
+                    elif stream_chunk["type"] == "error":
+                        yield {"type": "error", "message": stream_chunk["message"]}
+                        return
+
+                if result is None:
+                    yield {"type": "error", "message": "模型调用返回为空"}
                     return
 
                 model_call_count += 1
                 record.record_attempt()
                 ctx.append_assistant(result.text, result.tool_calls)
-
-                if result.reasoning_content:
-                    yield {"type": "reasoning", "content": result.reasoning_content}
 
                 # ── 执行工具 ──
                 if result.tool_calls:
@@ -171,7 +205,10 @@ class Engine:
                                 })
                                 continue
 
-                        exec_result = executor.execute(tc["name"], tc["args"])
+                        exec_result = executor.execute(tc["name"], tc["args"], mode=mode)
+                        # 记录工具影响到的文件 hash，用于跨模型调用的变更检测
+                        for p in exec_result.affected_paths:
+                            ctx.record_file_access(p)
                         detector.record_call(tc["name"], tc["args"], exec_result.success)
                         ctx.append_tool_result(tc["id"], exec_result.output)
                         record.record_tool(tc["name"])

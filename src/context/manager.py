@@ -1,4 +1,6 @@
+import hashlib
 import json
+from pathlib import Path
 
 from src.context.compact import compact_history
 from src.engine.executor import ToolExecutor
@@ -48,6 +50,7 @@ class ContextManager:
         self._messages: list[dict] = []
         self._prompt_caching = prompt_caching
         self._history_budget = history_budget
+        self._file_hashes: dict[str, str] = {}  # 路径 → SHA-256 hex
         # 初始化时立即构建系统提示，保证 /context 有数据
         self._messages = [
             {"role": "system", "content": self._system_prompt(), **self._cache_tag()},
@@ -57,6 +60,62 @@ class ContextManager:
 
     def refresh(self):
         self._workspace = WorkspaceContext.build(self.workspace_root)
+
+    @property
+    def history(self) -> list[dict]:
+        """暴露跨轮历史，供外部持久化。"""
+        return list(self._history)
+
+    def restore_history(self, messages: list[dict]):
+        """从持久化存储加载历史，恢复跨轮对话上下文。"""
+        self._history = list(messages)
+
+    # ── 文件 SHA-256 追踪，用于跨模型调用的变更检测 ──
+
+    def record_file_access(self, path: str):
+        """记录模型接触过的文件的 SHA-256 hash。
+
+        在工具执行（读/写文件）后调用，以便后续模型调用前
+        重新 hash 对比，检测外部修改。
+        """
+        abs_path = str(Path(path).resolve())
+        try:
+            h = hashlib.sha256(Path(abs_path).read_bytes()).hexdigest()
+        except OSError:
+            h = ""
+        self._file_hashes[abs_path] = h
+
+    def check_file_changes(self) -> list[dict]:
+        """重新计算所有已追踪文件的 hash，返回发生变更的文件列表。
+
+        每条记录: {path, old_hash (前12位), new_hash (前12位)}
+        同时就地更新 self._file_hashes 为最新值。
+        """
+        changes: list[dict] = []
+        for path, old_hash in list(self._file_hashes.items()):
+            try:
+                new_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except OSError:
+                new_hash = ""
+            if new_hash and new_hash != old_hash:
+                changes.append(
+                    {
+                        "path": path,
+                        "old_hash": old_hash[:12],
+                        "new_hash": new_hash[:12],
+                    }
+                )
+                self._file_hashes[path] = new_hash
+        return changes
+
+    def rebuild_system_prompt(self):
+        """用最新工作区状态重建第一条 system 消息的内容。
+
+        检测到外部文件变更后调用，相当于"刷新模型看到的对当前工作区的认知"。
+        """
+        self.refresh()
+        if self._messages and self._messages[0].get("role") == "system":
+            self._messages[0]["content"] = self._system_prompt()
 
     def _cache_tag(self) -> dict:
         """返回 cache_control 标记，仅当启用 prompt_caching 时生效。"""
@@ -162,6 +221,16 @@ class ContextManager:
                 stats[key]["pct"] = 0.0
         return stats
 
+    def inject_plan(self, plan_content: str):
+        """将已批准的计划注入系统提示末尾。
+
+        在执行阶段（/execute 后）调用，追加到第一条 system 消息的末尾，
+        后续模型每次调用都能看到计划内容。
+        """
+        if self._messages and self._messages[0].get("role") == "system":
+            footer = "\n\n以下是被批准的执行计划:\n" + plan_content
+            self._messages[0]["content"] += footer
+
     # ── append ───────────────────────────────────────────────────
 
     def append_assistant(self, text: str, tool_calls: list[dict] | None = None):
@@ -192,10 +261,27 @@ class ContextManager:
     # ── internals ────────────────────────────────────────────────
 
     def _system_prompt(self) -> str:
-        return (
-            "You are Jarvis, Tony Stark's super AI assistant. You are now helping Tony write code..\n"
-            "Use the available tools to read, write, and modify files.\n"
-            "When the task is complete, return a final answer in natural language.\n"
-            "Never invent tool results.\n"
-            f"\nCurrent workspace:\n{self._workspace.text()}"
-        )
+        prompt = f"""You are Jarvis (J.A.R.V.I.S.), Tony Stark's super AI assistant. You are now assisting Mr. Stark with writing code.
+
+    Use the available tools to read, write, and modify files.
+    When the task is complete, return a final answer in natural language.
+    Never invent tool results. Always ground your responses in the actual output of the tools you have used.
+
+    【Core Persona & Tone】
+    - You always address the user as "Sir", in the manner of a wise, composed, and impeccably tasteful British butler. Remain calm and poised in every situation.
+    - Be concise and precise. Always deliver the conclusion or solution first, then offer supporting details — as if delivering a status report on the Iron Man suit.
+    - You possess a refined dry wit and subtle British sarcasm. When Sir makes an obvious mistake, you point it out with respect but a touch of gentle teasing, e.g., "Sir, I feel obliged to mention that this semicolon appears to still be on holiday." Never be mean or cutting.
+    - When Sir is frustrated or facing a setback, you offer steady reassurance: "We have all been there, Sir. Shall we take a moment, pour a cup of coffee, and then trace through the stack together?"
+
+    【Tool Usage & Truthful Reporting】
+    - You must always rely on the actual results returned by the tools. You will not fabricate, imagine, or embellish what the tools report.
+    - Once the task is fully complete, deliver a final summary in natural language, in Jarvis's characteristic tone.
+
+    【Proactive Coding Conduct】
+    - You are a world-class coding partner. Anticipate Sir's needs. When you complete a core task, naturally supplement it with corresponding tests, optimisation suggestions, or a quiet alert about potential risks — just as you would monitor the suit's integrity.
+    - If Sir's instruction could lead to a problem, you respectfully but directly intervene: "Sir, I must respectfully advise caution. This approach carries a risk of energy bleed under concurrent loads. I recommend adding a caching layer as a shield."
+    - When an instruction is ambiguous, you never guess. Instead, you ask a precise clarifying question: "Sir, regarding the instruction to 'make it faster' — are we aiming to reduce time complexity, or to improve I/O throughput?"
+
+    Current workspace:
+    {self._workspace.text()}"""
+        return prompt

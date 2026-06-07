@@ -2,6 +2,7 @@
 
 import itertools
 import os
+import re
 import sys
 import threading
 import time
@@ -9,12 +10,46 @@ from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
 from src.agent import Agent
 from src.trace.store import RunStore
 
 style = Style.from_dict({"prompt": "ansicyan bold"})
+
+# ── 推理流式渲染状态 ──
+_reasoning_active = False
+
+# ── 上下文进度条 ──
+_ctx_bar = {"prompt_tokens": 0, "max_tokens": 1_000_000}
+
+
+def _ctx_bar_text() -> str:
+    total = _ctx_bar["prompt_tokens"]
+    mx = _ctx_bar["max_tokens"]
+    pct = total / mx * 100 if mx > 0 else 0
+    bar_len = 16
+    filled = int(pct / 100 * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    pct_str = f"{pct:.1f}%" if total > 0 else "-"
+    tok_str = f"{total:,}" if total > 0 else "0"
+    return f" ctx: {bar} {pct_str} ({tok_str} / {mx:,})"
+
+# ── 键绑定：Enter 提交，Alt+Enter（Esc+Enter）换行 ──
+kb = KeyBindings()
+
+
+@kb.add("enter")
+def _submit(event):
+    """按 Enter 提交当前输入。"""
+    event.current_buffer.validate_and_handle()
+
+
+@kb.add("escape", "enter")
+def _newline(event):
+    """按 Alt+Enter（或 Esc 后跟 Enter）插入换行。"""
+    event.current_buffer.insert_text("\n")
 
 # ── 计费参考（$/1M tokens）──
 PRICING = {
@@ -74,6 +109,7 @@ def _estimate_cost(model: str, prompt_tok: int, completion_tok: int) -> float:
 # ── CLI 主循环 ──────────────────────────────────────────────────
 
 def main():
+    global _reasoning_active
     workspace = os.getcwd()
     approval = "ask"
     resume = None
@@ -92,6 +128,7 @@ def main():
         agent = Agent(workspace_root=workspace, approval_policy=approval, session_dir=resume)
     else:
         agent = Agent(workspace_root=workspace, approval_policy=approval)
+    _ctx_bar["max_tokens"] = agent.context_window
 
     history_path = Path(workspace) / ".jarvis" / ".cli_history"
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +136,8 @@ def main():
     psession = PromptSession(
         history=FileHistory(str(history_path)),
         style=style, enable_history_search=True,
+        multiline=True, key_bindings=kb,
+        bottom_toolbar=lambda: _ctx_bar_text(),
     )
 
     if resume:
@@ -107,7 +146,7 @@ def main():
 
     while True:
         try:
-            query = psession.prompt("jarvis> ", style=style, multiline=False).strip()
+            query = psession.prompt("jarvis> ", style=style).strip()
         except (EOFError, KeyboardInterrupt):
             print(); break
 
@@ -124,10 +163,58 @@ def main():
             resumed = _do_resume(agent)
             if resumed:
                 agent = resumed
+                _ctx_bar["max_tokens"] = agent.context_window
             continue
         if query == "/context":
             _show_context(agent)
             continue
+
+        # ── Plan Mode 命令 ────────────────────────────────────────
+        if query.startswith("/plan "):
+            topic = query[6:].strip()
+            if not topic:
+                print("  Usage: /plan <topic>")
+                continue
+            agent.mode = "plan"
+            agent.topic = topic
+            # slugify: 保留中文和字母数字，其它转短横线
+            safe_topic = re.sub(r'[^\w\u4e00-\u9fff-]', '-', topic.lower())
+            agent.plan_path = f".jarvis/plans/{safe_topic}-plan.md"
+            # 确保 plans 目录存在
+            (Path(agent.workspace_root) / ".jarvis" / "plans").mkdir(parents=True, exist_ok=True)
+            _dim(f"  📋 进入计划模式，计划文件将写入 {agent.plan_path}")
+            query = (
+                f"请分析以下需求并制定详细计划，将完整的计划文件写入 `{agent.plan_path}`。\n\n"
+                f"## 需求\n{topic}\n\n"
+                f"请先探索相关代码，然后写出包含步骤、涉及文件、风险分析的计划。"
+            )
+            # 继续执行（进入 plan mode 的 agent.ask_stream）
+        elif query == "/execute":
+            if agent.mode != "plan" or not agent.plan_path:
+                print("  没有待执行的计划。请先用 /plan <topic> 创建计划。")
+                continue
+            plan_file = Path(agent.workspace_root) / agent.plan_path
+            if not plan_file.exists():
+                print(f"  计划文件不存在: {agent.plan_path}")
+                continue
+            plan_content = plan_file.read_text(encoding="utf-8")
+            agent._pending_plan = plan_content
+            agent.mode = "default"
+            saved_topic = agent.topic
+            agent.topic = ""
+            agent.plan_path = ""
+            query = f"请按已被批准的计划执行：「{saved_topic}」"
+            _dim(f"  ✅ 计划已批准，开始执行「{saved_topic}」")
+        elif query == "/cancel":
+            if agent.mode == "plan":
+                agent.mode = "default"
+                agent.topic = ""
+                agent.plan_path = ""
+                print("  计划已取消。")
+            else:
+                print("  当前没有活跃的计划。")
+            continue
+
         if query == "/help":
             _print_help(); continue
 
@@ -144,16 +231,22 @@ def main():
                     spinner.stop()
                     spinner = None
 
+                # 推理流结束 → 换行
+                if _reasoning_active and event["type"] != "reasoning":
+                    print(flush=True)
+                    _reasoning_active = False
+
                 # 渲染
                 _render_event(event)
 
-                # 累计用量
+                # 累计用量 & 上下文进度条
                 if event.get("type") in ("tool_result", "final", "step_limit", "error"):
                     meta = agent.model_client.last_completion_metadata
                     usage = meta.get("usage", {}) or {}
                     prompt_tok += usage.get("prompt_tokens", 0) or 0
                     completion_tok += usage.get("completion_tokens", 0) or 0
                     cached_tok += meta.get("cached_tokens", 0) or 0
+                    _ctx_bar["prompt_tokens"] = usage.get("prompt_tokens", 0) or 0
 
                 # 启动 spinner
                 if event["type"] == "trace" and event.get("event") == "model_requested":
@@ -168,25 +261,39 @@ def main():
         if spinner:
             spinner.stop()
 
+        # 安全清理：防止推理流未正常结束
+        if _reasoning_active:
+            print(flush=True)
+            _reasoning_active = False
+
         # Token 汇总
         if prompt_tok or completion_tok:
             model = agent.model_client.model
             cost = _estimate_cost(model, prompt_tok, completion_tok)
             rate = cached_tok / prompt_tok * 100 if prompt_tok else 0
+            mx = _ctx_bar["max_tokens"]
+            ctx_pct = _ctx_bar["prompt_tokens"] / mx * 100 if mx > 0 else 0
             _dim(f"  ├─ 输入 {prompt_tok:>6} tok | 输出 {completion_tok:>6} tok | "
                  f"缓存 {cached_tok:>6} tok ({rate:.0f}%) | 费用 ${cost:.4f}")
+            _dim(f"  └─ ctx {_ctx_bar['prompt_tokens']:>6} / {mx:,} tok ({ctx_pct:.1f}%)")
         print(flush=True)
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 
 def _render_event(event: dict):
+    global _reasoning_active
     t = event["type"]
     if t == "trace" and event.get("event") == "model_requested":
         _dim(f"  ── 模型调用 {event.get('seq', '')} ──")
     elif t == "reasoning":
-        for line in (event.get("content", "") or "").strip().split("\n"):
-            _dim(f"  🧠 {line[:200]}")
+        content = (event.get("content", "") or "")
+        if not _reasoning_active:
+            _reasoning_active = True
+            sys.stdout.write(f"  🧠 {content}")
+        else:
+            sys.stdout.write(content)
+        sys.stdout.flush()
     elif t == "tool_call":
         _tool_line(event["name"], _compact_args(event.get("args", {})))
     elif t == "tool_result":
@@ -244,15 +351,30 @@ def _compact_args(args: dict) -> str:
 
 
 def _find_latest_session(workspace: str, skip_id: str = "") -> str | None:
-    """返回除了 skip_id 之外最近的一个会话目录路径。"""
+    """返回除了 skip_id 之外最近的一个有实际数据的会话目录路径。
+
+    跳过空会话（创建后从未产生过 turn 数据），解决连续重启应用后
+    /resume 恢复到了空会话而非真正有数据的会话的问题。
+    """
+    skipped_empty = 0
     sessions = Agent.list_sessions(workspace)
     for s in sessions:
         sid = s.get("session_id", "")
         if sid == skip_id:
             continue
         path = Path(workspace) / ".jarvis" / "sessions" / sid
-        if path.exists():
-            return str(path)
+        if not path.exists():
+            continue
+        # 跳过没有实际 turn 数据的空会话
+        turns_dir = path / "turns"
+        if not turns_dir.is_dir() or not any(turns_dir.iterdir()):
+            skipped_empty += 1
+            continue
+        if skipped_empty:
+            _dim(f"  （跳过 {skipped_empty} 个空会话）")
+        return str(path)
+    if skipped_empty:
+        _dim(f"  （跳过 {skipped_empty} 个空会话，未找到有数据的会话）")
     return None
 
 
@@ -316,17 +438,25 @@ def _print_banner(agent: Agent, workspace: str, approval: str):
     print(f"  Cwd:     {workspace}")
     print(f"  审批:     {approval}")
     print("\033[2m" + "─" * 50 + "\033[0m")
-    print("  /help 查看命令。\n")
+    print("  /help 查看命令。  Alt+Enter 换行输入。")
 
 
 def _print_help():
     print("  命令:")
-    print("    /exit, /quit    退出")
-    print("    /session        查看当前会话")
-    print("    /sessions       列出所有会话")
-    print("    /resume         恢复最近中断的会话")
-    print("    /context        查看上下文各 section 占比")
-    print("    /help           帮助")
+    print("    /exit, /quit          退出")
+    print("    /session              查看当前会话")
+    print("    /sessions             列出所有会话")
+    print("    /resume               恢复最近中断的会话")
+    print("    /context              查看上下文各 section 占比")
+    print("    /plan <topic>         进入计划模式，分析并写出计划文件")
+    print("    /execute              批准计划并开始执行")
+    print("    /cancel               取消当前计划")
+    print("    /help                 帮助")
+    print()
+    print("  计划模式 (Plan Mode):")
+    print("    /plan <topic>         分析代码、制定计划 → 写入 .jarvis/plans/")
+    print("    /execute              读取计划、注入上下文 → 开始执行")
+    print("    /cancel               丢弃当前计划，退出计划模式")
     print()
     print("  启动:")
     print("    python main.py             新建会话（ask 审批）")

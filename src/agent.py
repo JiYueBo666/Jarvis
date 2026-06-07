@@ -50,9 +50,13 @@ class Agent:
         self.tools = build_registry(workspace_root=self.workspace_root)
         self.executor = ToolExecutor(self.tools)
         self.ctx = ContextManager(
-            self.executor, self.workspace_root,
-            prompt_caching=prompt_caching, history_budget=history_budget,
+            self.executor,
+            self.workspace_root,
+            prompt_caching=prompt_caching,
+            history_budget=history_budget,
         )
+        if self._resume_state:
+            self.ctx.preview_resume(self._resume_state)
 
     # ── 会话管理 ────────────────────────────────────────────
 
@@ -132,7 +136,11 @@ class Agent:
 
         task_id = None
         for event in Engine.run_stream(
-            self.model_client, self.executor, self.ctx, self.bus, query,
+            self.model_client,
+            self.executor,
+            self.ctx,
+            self.bus,
+            query,
             max_new_tokens=self.max_new_tokens,
             approval_policy=self.approval_policy,
         ):

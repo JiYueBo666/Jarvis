@@ -11,18 +11,16 @@
 ```ini
 API_KEY=sk-your_key_here
 BASE_URL=https://api.deepseek.com/v1
-SPEED_MODEL=deepseek-chat        # 快速模型，用于简单对话和工具调用
-HIGH_MODEL=deepseek-reasoner     # 高能力模型，用于复杂推理和规划
+SPEED_MODEL=deepseek-v4-flash       # 快速模型，用于简单对话和工具调用
+HIGH_MODEL=deepseek-v4-pro     # 高能力模型，用于复杂推理和规划
 ```
 
 支持任何 OpenAI 兼容 API，可替换为其他服务商：
 
 | 服务商 | BASE_URL | SPEED_MODEL / HIGH_MODEL |
 |-------|----------|-------------------------|
-| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` / `deepseek-reasoner` |
-| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o-mini` / `gpt-4o` |
-| **通义千问** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` / `qwen-max` |
-| **GLM** | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` / `glm-4-plus` |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` / `deepseek-v4` |
+
 
 ### 2. 安装依赖
 

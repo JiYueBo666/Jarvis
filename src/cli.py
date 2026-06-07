@@ -125,6 +125,9 @@ def main():
             if resumed:
                 agent = resumed
             continue
+        if query == "/context":
+            _show_context(agent)
+            continue
         if query == "/help":
             _print_help(); continue
 
@@ -240,20 +243,22 @@ def _compact_args(args: dict) -> str:
     return ", ".join(parts)
 
 
-def _find_latest_session(workspace: str) -> str | None:
-    """返回最近一个会话目录的路径。"""
+def _find_latest_session(workspace: str, skip_id: str = "") -> str | None:
+    """返回除了 skip_id 之外最近的一个会话目录路径。"""
     sessions = Agent.list_sessions(workspace)
-    if not sessions:
-        return None
-    latest = sessions[0]
-    sid = latest.get("session_id", "")
-    path = Path(workspace) / ".jarvis" / "sessions" / sid
-    return str(path) if path.exists() else None
+    for s in sessions:
+        sid = s.get("session_id", "")
+        if sid == skip_id:
+            continue
+        path = Path(workspace) / ".jarvis" / "sessions" / sid
+        if path.exists():
+            return str(path)
+    return None
 
 
 def _do_resume(agent: Agent) -> Agent | None:
     """恢复上一个会话，返回新 Agent 或 None。"""
-    path = _find_latest_session(agent.workspace_root)
+    path = _find_latest_session(agent.workspace_root, skip_id=agent.session_id)
     if not path:
         print("  没有历史会话。")
         return None
@@ -267,6 +272,26 @@ def _do_resume(agent: Agent) -> Agent | None:
     )
     _notice(f"已恢复会话: {new_agent.session_id}")
     return new_agent
+
+
+def _show_context(agent: Agent):
+    """显示当前上下文的各 section 占比。"""
+    stats = agent.ctx.context_stats()
+    order = ["system", "history", "user", "assistant", "tool"]
+    labels = {
+        "system": "系统提示", "history": "历史消息",
+        "user": "用户输入", "assistant": "模型回复",
+        "tool": "工具结果",
+    }
+    total = stats["_total"]
+    print(f"  总上下文: {total['chars']} 字符 ≈ {total['tokens']} tok")
+    for key in order:
+        s = stats[key]
+        bar_len = 20
+        filled = int(s["pct"] / 100 * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        print(f"  {bar} {labels[key]:8s} {s['chars']:>6} chars {s['pct']:>5.1f}% ({s['messages']} 条)")
+    print()
 
 
 def _list_sessions(agent: Agent):
@@ -300,6 +325,7 @@ def _print_help():
     print("    /session        查看当前会话")
     print("    /sessions       列出所有会话")
     print("    /resume         恢复最近中断的会话")
+    print("    /context        查看上下文各 section 占比")
     print("    /help           帮助")
     print()
     print("  启动:")

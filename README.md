@@ -11,19 +11,40 @@
 ```ini
 API_KEY=sk-your_key_here
 BASE_URL=https://api.deepseek.com/v1
-SPEED_MODEL=deepseek-chat
-HIGH_MODEL=deepseek-chat
+SPEED_MODEL=deepseek-chat        # 快速模型，用于简单对话和工具调用
+HIGH_MODEL=deepseek-reasoner     # 高能力模型，用于复杂推理和规划
 ```
 
-支持任何 OpenAI 兼容 API：DeepSeek、OpenAI、通义千问、GLM 等。
+支持任何 OpenAI 兼容 API，可替换为其他服务商：
 
-### 2. 安装
+| 服务商 | BASE_URL | SPEED_MODEL / HIGH_MODEL |
+|-------|----------|-------------------------|
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` / `deepseek-reasoner` |
+| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o-mini` / `gpt-4o` |
+| **通义千问** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` / `qwen-max` |
+| **GLM** | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` / `glm-4-plus` |
+
+### 2. 安装依赖
+
+推荐使用虚拟环境安装：
+
+```bash
+# 创建虚拟环境（推荐）
+python -m venv .venv
+source .venv/bin/activate    # Linux/macOS
+# 或 .venv\Scripts\activate  # Windows
+
+# 安装依赖（含项目自身）
+pip install -e .
+```
+
+或者直接使用 pip 安装（全局或当前环境）：
 
 ```bash
 pip install -e .
 ```
 
-### 3. 运行
+### 3. 启动
 
 ```bash
 python main.py
@@ -127,6 +148,7 @@ python main.py --resume     # 启动后自动恢复上一个会话
 - pydantic-settings >= 2.14.1
 - prompt-toolkit >= 3.0.52
 - rich >= 15.0.0
+- typer >= 0.26.4
 
 ## 架构
 

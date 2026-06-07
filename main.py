@@ -1,4 +1,4 @@
-from src.Tui.cli import app
+from src.cli import main
 
 if __name__ == "__main__":
-    app()
+    main()

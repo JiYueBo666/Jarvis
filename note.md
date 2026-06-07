@@ -78,3 +78,15 @@ context_manager.py:146 的 reduction loop 按固定优先级压缩
 其中 task、files、notes 是旧格式镜像，从 working 和 episodic_notes 派生，为了兼容早期 session 数据。实际读写都走 working 和 episodic_notes。
 ```
 ![alt text](assets/image.png)
+
+
+
+## 生命周期管理
+> Runtime恢复和模型恢复是两码事
+![alt text](assets/img2.png)
+
+### Jarvis自身状态恢复
+Runtime恢复，重建总线、工具、系统提示等等，这些是Runtime自身状态恢复
+
+### Checkpoint模型自身恢复
+![alt text](assets/img3.png)

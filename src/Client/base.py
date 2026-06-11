@@ -6,7 +6,9 @@ from src.Agent.models import Message
 
 class LLMClient(ABC):
     @abstractmethod
-    async def chat(self, messages: list[Message]) -> Message:
+    async def chat(
+        self, messages: list[Message], tools: list[dict] | None = None
+    ) -> Message:
         ...
 
     @property

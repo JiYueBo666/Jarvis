@@ -11,4 +11,8 @@ dependencies = [
     "prompt-toolkit>=3.0.52",
     "rich>=15.0.0",
     "typer>=0.26.4",
+    "python-dotenv>=1.0.0",
 ]
+
+[project.scripts]
+coding-agent = "src.main:cli"

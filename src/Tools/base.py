@@ -26,6 +26,10 @@ class Tool:
 
     _registry: ClassVar[dict[str, type["Tool"]]] = {}
 
+    """
+    构造子类时候自动识别到该函数并调用
+    """
+
     def __init_subclass__(cls, **kwargs):
         """Auto-register subclasses that have a non-empty name."""
         super().__init_subclass__(**kwargs)
@@ -34,6 +38,9 @@ class Tool:
 
     @classmethod
     def collect(cls) -> list[Tool]:
+        """
+        返回类
+        """
         """Scan all registered tools and return an instance of each."""
         return [tool_cls() for tool_cls in cls._registry.values()]
 

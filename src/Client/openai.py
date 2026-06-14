@@ -1,8 +1,12 @@
 """OpenAI-compatible LLM client adapter."""
 
+from __future__ import annotations
+
+import asyncio
 import json
+
 from openai import AsyncOpenAI
-from src.Client.base import LLMClient
+from src.Client.base import LLMClient, StreamEvent
 from src.Agent.models import Message, ToolCall
 
 
@@ -44,3 +48,44 @@ class OpenAIClient(LLMClient):
                 ],
             )
         return Message(role="assistant", content=msg.content or "")
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        channel: asyncio.Queue[StreamEvent],
+        tools: list[dict] | None = None,
+    ) -> None:
+        """Push StreamEvent events into channel. Ends with StreamEvent("done")."""
+        stream = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[m.model_dump(exclude_none=True) for m in messages],
+            tools=tools,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+
+            if delta.content:
+                await channel.put(StreamEvent("delta", delta.content))
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx is None or tc_delta.function is None:
+                        continue
+                    await channel.put(
+                        StreamEvent(
+                            "tool_call",
+                            data={
+                                "index": idx,
+                                "id": tc_delta.id,
+                                "name": tc_delta.function.name,
+                                "arguments": tc_delta.function.arguments,
+                            },
+                        )
+                    )
+
+        await channel.put(StreamEvent("done"))

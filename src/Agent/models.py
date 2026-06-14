@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from typing import Literal
+from typing import Literal, List
 
 
 class ToolCall(BaseModel):
     id: str
     name: str
     arguments: dict
+
+
+class AgentMessage(BaseModel):
+    systemPrompt: str
+    messages: List[Message]
+    tools: List[dict]
 
 
 class Message(BaseModel):

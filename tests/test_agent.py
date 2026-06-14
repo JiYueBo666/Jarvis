@@ -1,7 +1,8 @@
+import asyncio
 import pytest
 from src.Agent.models import Message, ToolCall
 from src.Agent.loop import AgentLoop
-from src.Client.base import LLMClient
+from src.Client.base import LLMClient, StreamEvent
 from src.Tools.base import Tool, ToolRegistry, ToolExecutor
 
 
@@ -19,6 +20,16 @@ class ThinkClient(LLMClient):
         step = self.steps[self.idx % len(self.steps)]
         self.idx += 1
         return step
+
+    async def chat_stream(self, messages, channel, tools=None):
+        step = self.steps[self.idx % len(self.steps)]
+        self.idx += 1
+        if step.content:
+            await channel.put(StreamEvent("delta", step.content))
+        if step.tool_calls:
+            for tc in step.tool_calls:
+                await channel.put(StreamEvent("tool_call", tc))
+        await channel.put(StreamEvent("done"))
 
 
 class StubTool(Tool):

@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
+
+from pydantic import BaseModel
+
+
+class ToolParameter(BaseModel):
+    """Structured definition of a single tool parameter."""
+
+    name: str
+    type: str
+    description: str = ""
+    required: bool = True
+    default: Any = None
 
 
 class Tool:
     name: str = ""
     description: str = ""
-    parameters: dict = {}
+    parameters: list[ToolParameter] = []
     readonly: bool = True
     dangerous: bool = False
 
@@ -26,12 +38,28 @@ class Tool:
         return [tool_cls() for tool_cls in cls._registry.values()]
 
     def to_openai_schema(self) -> dict:
+        properties = {}
+        required = []
+        for p in self.parameters:
+            prop: dict[str, Any] = {"type": p.type}
+            if p.description:
+                prop["description"] = p.description
+            if p.default is not None:
+                prop["default"] = p.default
+            properties[p.name] = prop
+            if p.required:
+                required.append(p.name)
+
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": schema,
             },
         }
 

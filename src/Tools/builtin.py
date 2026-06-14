@@ -3,7 +3,7 @@
 from pathlib import Path
 import subprocess
 
-from src.Tools.base import Tool
+from src.Tools.base import Tool, ToolParameter
 
 
 class ReadFileTool(Tool):
@@ -11,16 +11,9 @@ class ReadFileTool(Tool):
     readonly = True
     dangerous = False
     description = "Read the contents of a file"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Path to the file to read",
-            }
-        },
-        "required": ["file_path"],
-    }
+    parameters = [
+        ToolParameter(name="file_path", type="string", description="Path to the file to read"),
+    ]
 
     async def execute(self, args: dict) -> str:
         path = Path(args["file_path"])
@@ -34,14 +27,10 @@ class WriteFileTool(Tool):
     readonly = False
     dangerous = False
     description = "Write content to a file (creates or overwrites)"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string"},
-            "content": {"type": "string"},
-        },
-        "required": ["file_path", "content"],
-    }
+    parameters = [
+        ToolParameter(name="file_path", type="string", description="File path to write to"),
+        ToolParameter(name="content", type="string", description="Content to write"),
+    ]
 
     async def execute(self, args: dict) -> str:
         path = Path(args["file_path"])
@@ -55,16 +44,9 @@ class RunShellTool(Tool):
     readonly = False
     dangerous = True
     description = "Run a shell command and return its output"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "Shell command to execute",
-            }
-        },
-        "required": ["command"],
-    }
+    parameters = [
+        ToolParameter(name="command", type="string", description="Shell command to execute"),
+    ]
 
     async def execute(self, args: dict) -> str:
         result = subprocess.run(
@@ -87,20 +69,10 @@ class SearchCodeTool(Tool):
     readonly = True
     dangerous = False
     description = "Search for a pattern in code files using grep"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "Regex pattern to search",
-            },
-            "path": {
-                "type": "string",
-                "description": "Directory path to search",
-            },
-        },
-        "required": ["pattern"],
-    }
+    parameters = [
+        ToolParameter(name="pattern", type="string", description="Regex pattern to search"),
+        ToolParameter(name="path", type="string", description="Directory path to search", required=False),
+    ]
 
     async def execute(self, args: dict) -> str:
         search_path = args.get("path", ".")

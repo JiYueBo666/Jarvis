@@ -15,4 +15,5 @@ wheels/
 
 # OS files
 .DS_Store
-Thumbs.db.worktrees/
+Thumbs.db
+.worktrees/

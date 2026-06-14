@@ -8,6 +8,8 @@ from src.Tools.base import Tool
 
 class ReadFileTool(Tool):
     name = "read_file"
+    readonly = True
+    dangerous = False
     description = "Read the contents of a file"
     parameters = {
         "type": "object",
@@ -29,6 +31,8 @@ class ReadFileTool(Tool):
 
 class WriteFileTool(Tool):
     name = "write_file"
+    readonly = False
+    dangerous = False
     description = "Write content to a file (creates or overwrites)"
     parameters = {
         "type": "object",
@@ -48,6 +52,8 @@ class WriteFileTool(Tool):
 
 class RunShellTool(Tool):
     name = "run_shell"
+    readonly = False
+    dangerous = True
     description = "Run a shell command and return its output"
     parameters = {
         "type": "object",
@@ -78,6 +84,8 @@ class RunShellTool(Tool):
 
 class SearchCodeTool(Tool):
     name = "search_code"
+    readonly = True
+    dangerous = False
     description = "Search for a pattern in code files using grep"
     parameters = {
         "type": "object",

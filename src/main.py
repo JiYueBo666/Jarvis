@@ -6,8 +6,7 @@ from dotenv import load_dotenv
 
 from src.Agent import AgentLoop, Message
 from src.Client import OpenAIClient
-from src.Tools import ToolRegistry, ToolExecutor
-from src.Tools.builtin import ReadFileTool, WriteFileTool, RunShellTool, SearchCodeTool
+from src.Tools import Tool, ToolRegistry, ToolExecutor
 
 
 def create_agent() -> tuple[AgentLoop, ToolRegistry]:
@@ -17,11 +16,7 @@ def create_agent() -> tuple[AgentLoop, ToolRegistry]:
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         model=os.getenv("LLM_MODEL", "gpt-4o"),
     )
-    registry = ToolRegistry()
-    registry.register(ReadFileTool())
-    registry.register(WriteFileTool())
-    registry.register(RunShellTool())
-    registry.register(SearchCodeTool())
+    registry = ToolRegistry(Tool.collect())
     executor = ToolExecutor(registry)
     return AgentLoop(client=client, executor=executor), registry
 

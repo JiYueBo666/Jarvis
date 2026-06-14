@@ -38,8 +38,6 @@ class AgentLoop:
             # Execute each tool call and append results
             for tc in response.tool_calls:
                 result = await self._executor.execute(tc.name, tc.arguments)
-                history.append(
-                    Message(role="tool", content=result, tool_call_id=tc.id)
-                )
+                history.append(Message(role="tool", content=result, tool_call_id=tc.id))
 
         return f"Reached max steps ({self._max_steps}) without final answer"

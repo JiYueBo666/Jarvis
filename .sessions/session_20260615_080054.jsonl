@@ -1,0 +1,2 @@
+{"role": "user", "content": "读一下readme", "time": "2026-06-15T08:00:54.307927+00:00", "model": "deepseek-v4-flash"}
+{"role": "assistant", "content": "\n\n[Error: Error code: 400 - {'error': {'message': \"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)\", 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_request_error'}}]", "time": "2026-06-15T08:00:56.038919+00:00", "model": "deepseek-v4-flash"}

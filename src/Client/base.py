@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 
-from src.Agent.models import Message
+from src.Agent.models import Message, ToolCall
 
 
 class StreamEvent:
@@ -60,3 +61,46 @@ class LLMClient(ABC):
     @property
     @abstractmethod
     def model_name(self) -> str: ...
+
+
+# ── 格式转换 ──────────────────────────────────────
+
+
+def convert_to_llm(messages: list[Message]) -> list[dict]:
+    """内部 Message → OpenAI 格式 dict 列表。"""
+    llm_messages = []
+    for message in messages:
+        if message.role in ("user", "system"):
+            llm_messages.append({"role": message.role, "content": message.content})
+        elif message.role == "assistant":
+            d: dict = {"role": "assistant", "content": message.content}
+            if message.reasoning_content:
+                d["reasoning_content"] = message.reasoning_content
+            if message.tool_calls:
+                d["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in message.tool_calls
+                ]
+            llm_messages.append(d)
+        elif message.role == "tool":
+            d: dict[str, object] = {
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": message.content,
+            }
+            if message.tool_name:
+                d["name"] = message.tool_name
+            llm_messages.append(d)
+        elif message.role == "contextSummary":
+            llm_messages.append({
+                "role": "user",
+                "content": f"The summary of the context: {message.content}",
+            })
+    return llm_messages

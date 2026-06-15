@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from enum import Enum
 
 from src.Agent.loop import (
     AgentContext,
@@ -18,14 +17,6 @@ from src.Client.base import StreamEvent
 from src.Tools.base import Tool, ToolExecutor
 
 
-class ThinkingLevel(Enum):
-    OFF = "off"
-    MINIMAL = "minimal"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-
 # ── 状态 ─────────────────────────────────────────────────
 
 
@@ -36,7 +27,7 @@ class AgentState:
     # 持久状态（跨轮次保留）
     system_prompt: str = ""
     model: str = ""
-    thinking_level: ThinkingLevel = ThinkingLevel.OFF
+    thinking_level: str = "off"
     tools: list[Tool] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
 
@@ -96,8 +87,7 @@ class CodingAgent:
             case "message_end":
                 self.state.is_streaming = False
                 self.state.streaming_message = None
-                if event.message:
-                    self.state.messages.append(event.message)
+                # 不 append：streamAssistantResponse 已在 context.messages 中维护
 
             case "error":
                 self.state.is_streaming = False
@@ -135,8 +125,12 @@ class CodingAgent:
 
     # ── 入口 ─────────────────────────────────────────
 
-    async def prompt(self, input: str | list[Message] | dict) -> None:
-        """用户入口：传入消息，启动 runLoop。"""
+    async def prompt(
+        self,
+        input: str | list[Message] | dict,
+        approval_check: Callable[[str, dict], Awaitable[bool]] | None = None,
+    ) -> str | None:
+        """用户入口：传入消息，启动 runLoop。返回最后一条 assistant 消息内容。"""
         messages = self._normalize_input(input)
         self.state.messages.extend(messages)
 
@@ -151,7 +145,14 @@ class CodingAgent:
             executor=self.executor,
             signal=self._abort,
             emit=emit,
+            approval_check=approval_check,
         )
+
+        # 返回最后一条 assistant 消息内容
+        for msg in reversed(self.state.messages):
+            if msg.role == "assistant" and msg.content:
+                return msg.content
+        return None
 
     def _normalize_input(self, input: str | list[Message] | dict) -> list[Message]:
         if isinstance(input, str):
@@ -180,17 +181,20 @@ async def run_loop(
     executor: ToolExecutor,
     signal: asyncio.Event | None,
     emit: Callable[[StreamEvent], Awaitable[None]],
+    max_steps: int = 20,
+    approval_check: Callable[[str, dict], Awaitable[bool]] | None = None,
 ) -> None:
     """完整 Agent 循环：处理 steering 消息 → 调 LLM → 执行工具 → 继续。"""
     current_context = context
     first_turn = True
     pending_messages: list[Message] = await _get_steering(config)
+    steps = 0
 
     while True:
         has_more_tool_calls = True
 
         # 内层循环：处理 tool calls 和 steering 消息
-        while has_more_tool_calls or pending_messages:
+        while (has_more_tool_calls or pending_messages) and steps < max_steps:
             if first_turn:
                 first_turn = False
             else:
@@ -212,6 +216,7 @@ async def run_loop(
                 return
 
             # 调 LLM
+            steps += 1
             assistant_msg = await streamAssistantResponse(
                 context=current_context,
                 config=config,
@@ -223,7 +228,8 @@ async def run_loop(
             # 执行工具
             if assistant_msg.tool_calls:
                 tool_results = await _execute_tool_calls(
-                    assistant_msg, executor, current_context, new_messages, emit, signal
+                    assistant_msg, executor, current_context, new_messages,
+                    emit, signal, approval_check,
                 )
                 has_more_tool_calls = True
             else:
@@ -262,6 +268,11 @@ async def run_loop(
             # 新一轮 steering 消息
             pending_messages = await _get_steering(config)
 
+        # 达到最大步数
+        if steps >= max_steps:
+            await emit(StreamEvent("agent_end", data=f"Reached max steps ({max_steps})"))
+            return
+
         # 外层循环：follow-up 消息
         follow_up = await _get_follow_up(config)
         if follow_up:
@@ -280,6 +291,7 @@ async def _execute_tool_calls(
     new_messages: list[Message],
     emit: Callable[[StreamEvent], Awaitable[None]],
     signal: asyncio.Event | None = None,
+    approval_check: Callable[[str, dict], Awaitable[bool]] | None = None,
 ) -> list[Message]:
     """执行 assistant 消息中的工具调用。"""
     results: list[Message] = []
@@ -287,6 +299,13 @@ async def _execute_tool_calls(
     for tc in assistant_msg.tool_calls:
         if signal and signal.is_set():
             break
+
+        # 审批检查
+        if approval_check:
+            approved = await approval_check(tc.name, tc.arguments)
+            if not approved:
+                await emit(StreamEvent("error", data=f"用户拒绝了工具调用: {tc.name}"))
+                continue
 
         await emit(StreamEvent("tool_start", tool_name=tc.name, tool_call_id=tc.id))
 
@@ -298,7 +317,7 @@ async def _execute_tool_calls(
                 StreamEvent("error", data=result, tool_name=tc.name, tool_call_id=tc.id)
             )
 
-        tool_msg = Message(role="tool", content=result, tool_call_id=tc.id)
+        tool_msg = Message(role="tool", content=result, tool_call_id=tc.id, tool_name=tc.name)
         context.messages.append(tool_msg)
         new_messages.append(tool_msg)
         results.append(tool_msg)

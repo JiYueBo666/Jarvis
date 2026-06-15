@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from typing import Literal, List
+from typing import Literal
 
 
 class ToolCall(BaseModel):
@@ -12,19 +12,10 @@ class ToolCall(BaseModel):
     arguments: dict
 
 
-class AgentMessage(BaseModel):
-    systemPrompt: str
-    messages: List[Message]
-    tools: List[dict]
-
-
 class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
-
-
-class ToolResult(BaseModel):
-    tool_call_id: str
-    content: str
+    tool_name: str | None = None
+    reasoning_content: str | None = None

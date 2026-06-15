@@ -1,9 +1,8 @@
 """Agent implementation."""
 
-from .models import Message, ToolCall, ToolResult
+from .models import Message, ToolCall
 from .loop import (
     AgentContext,
-    AgentLoop,
     AgentLoopConfig,
     AssistantMessage,
     LLMResponse,
@@ -12,8 +11,8 @@ from .loop import (
 )
 
 __all__ = [
-    "Message", "ToolCall", "ToolResult",
-    "AgentContext", "AgentLoop", "AgentLoopConfig",
+    "Message", "ToolCall",
+    "AgentContext", "AgentLoopConfig",
     "AssistantMessage", "LLMResponse",
     "streamAssistantResponse", "stream_simple",
 ]

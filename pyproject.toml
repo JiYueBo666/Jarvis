@@ -7,11 +7,10 @@ requires-python = ">=3.11"
 dependencies = [
     "openai>=2.38.0",
     "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.1",
-    "prompt-toolkit>=3.0.52",
-    "rich>=15.0.0",
-    "typer>=0.26.4",
     "python-dotenv>=1.0.0",
+    "pygments>=2.18.0",
+    "wcwidth>=0.2.13",
+    "prompt-toolkit>=3.0.52",
 ]
 
 [project.scripts]

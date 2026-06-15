@@ -7,10 +7,13 @@ import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from src.Agent.models import Message, ToolCall
-from src.Client.base import LLMClient, StreamEvent
 from src.Tools.base import ToolExecutor
+
+if TYPE_CHECKING:
+    from src.Client.base import LLMClient
 
 # ── 类型定义 ──────────────────────────────────────────────
 
@@ -32,7 +35,6 @@ class AgentLoopConfig:
     api_key: str
     client: LLMClient
     convert_to_llm: Callable[[list[Message]], list[dict]]
-    transform_context: Callable[[list[Message]], Awaitable[list[Message]]] | None = None
     get_api_key: Callable[[str], str] | None = None
 
     # 生命周期钩子
@@ -84,6 +86,7 @@ class LLMResponse:
         )
 
         content = ""
+        thinking = ""
         tool_call_fragments: dict[int, dict[str, str]] = {}
         started = False
         error: str | None = None
@@ -94,6 +97,11 @@ class LLMResponse:
                 match event.type:
                     case "delta":
                         content += event.data
+                    case "thinking":
+                        thinking += event.data
+                        yield _StreamEventWithPartial("thinking", partial=Message(
+                            role="assistant", content=event.data,
+                        ))
                     case "tool_call":
                         data = event.data
                         idx: int = data["index"]
@@ -110,12 +118,15 @@ class LLMResponse:
                             frag["name"] += data["name"]
                         if data.get("arguments"):
                             frag["arguments"] += data["arguments"]
+                    case "error":
+                        error = event.data or "LLM stream error"
+                        continue  # 等 done 事件，最后由 done 处理并 yield error
                     case "done":
                         await producer
                         break
 
                 # 组装当前 partial
-                partial = _assemble(content, tool_call_fragments)
+                partial = _assemble(content, tool_call_fragments, reasoning_content=thinking)
 
                 if not started:
                     started = True
@@ -125,13 +136,13 @@ class LLMResponse:
         except Exception as e:
             error = str(e)
             yield _StreamEventWithPartial(
-                "error", partial=_assemble(content, tool_call_fragments)
+                "error", partial=_assemble(content, tool_call_fragments, reasoning_content=thinking)
             )
 
         if error:
-            self._final = _assemble(content, tool_call_fragments, error=error)
+            self._final = _assemble(content, tool_call_fragments, error=error, reasoning_content=thinking)
         else:
-            self._final = _assemble(content, tool_call_fragments)
+            self._final = _assemble(content, tool_call_fragments, reasoning_content=thinking)
         yield _StreamEventWithPartial("done", partial=self._final)
 
 
@@ -139,6 +150,7 @@ def _assemble(
     content: str,
     fragments: dict[int, dict[str, str]],
     error: str | None = None,
+    reasoning_content: str | None = None,
 ) -> Message:
     """从累积内容 + 工具调用碎片拼装 Message。"""
     tool_calls: list[ToolCall] = []
@@ -156,6 +168,7 @@ def _assemble(
         role="assistant",
         content=content_text,
         tool_calls=tool_calls or None,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -184,13 +197,9 @@ async def streamAssistantResponse(
 
     如果 signal 被设置，提前中止并返回积累的内容。
     """
+    from src.Client.base import StreamEvent
 
-    # 1. 转换上下文
-    messages = context.messages
-    if config.transform_context:
-        messages = await config.transform_context(messages)
-
-    # 2. 调 LLM，拿到事件流
+    # 1. 调 LLM，拿到事件流
     stream_fn = stream_fn or stream_simple
     response: LLMResponse = await stream_fn(config, context)
 
@@ -205,6 +214,9 @@ async def streamAssistantResponse(
                 context.messages.append(partial)
                 added_partial = True
                 await emit(StreamEvent("message_start", message=deepcopy(partial)))
+
+            case "thinking":
+                await emit(StreamEvent("thinking", data=event.partial.content or ""))
 
             case "text_delta" | "text_end":
                 if partial:
@@ -298,3 +310,5 @@ class AgentLoop:
                 history.append(Message(role="tool", content=result, tool_call_id=tc.id))
 
         return f"Reached max steps ({self._max_steps}) without final answer"
+
+

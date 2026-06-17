@@ -16,3 +16,7 @@ wheels/
 # OS files
 .DS_Store
 Thumbs.db
+
+.omo/
+.sessions/
+.worktrees/

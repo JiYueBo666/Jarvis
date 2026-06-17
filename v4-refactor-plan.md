@@ -1,371 +1,487 @@
-# Pico v4 重构设计
+# V4 重构计划：采用 pi 架构
 
-## 核心问题
+## 目标
 
-1. session/memory/checkpoint 都是裸 dict，缺乏类型约束，到处是防御性访问
-2. runtime.py 是 God Object（939 行，导入 23 个模块）
-3. 可观测代码散落在 6+ 个文件里，业务逻辑和日志记录混在一起
-4. memory 有旧格式镜像（task/files/notes），需要 normalize 双向同步
-5. tool_executor 和 runtime 存在循环依赖
-6. checkpoint 14 个字段中有 7 个冗余（可从 TaskState 实时计算）
-7. finish_stopped_run 和 finish_limited_run 代码重复
+将 Agent-mini 的架构从"薄组合根 + 静态引擎"重构为 pi 的"AgentSession（应用层）+ Agent（状态机/事件源）+ Loop（无状态内核）"三层架构。
 
-## 重构原则
-
-- 从 leaf 到 root，每阶段可独立测试
-- 数据结构 dataclass 化，替代裸 dict
-- engine/loop.py 是唯一编排点，所有可观测在这里触发
-- agent.py 是极薄组合根（~100 行），只持有状态 + 组装子系统
-- 依赖方向只能向下：agent → engine/guard/context/... → data/
-
-## 文件结构
+## 当前架构（V3）
 
 ```
-pico/
-├── data/                 # 纯 dataclass，零业务逻辑
-│   ├── session.py        # Session, SessionStore
-│   ├── memory.py         # MemoryState, FileSummary, EpisodicNote
-│   ├── task.py           # TaskState
-│   ├── checkpoint.py     # Checkpoint, CheckpointStore
-│   ├── trace.py          # TraceEvent, Span
-│   ├── identity.py       # RuntimeIdentity, ResumeState
-│   └── events.py         # EventBus (session event log)
-│
-├── providers/             # 不变
-│   ├── base.py
-│   ├── errors.py
-│   └── clients.py
-│
-├── tools/                 # 不变
-│   ├── schemas.py
-│   ├── base.py
-│   └── ...
-│
-├── workspace.py           # 不变
-│
-├── engine/                # 引擎层：只有编排 + 纯函数
-│   ├── loop.py            # run_turn() —— 唯一编排点
-│   ├── tool.py            # execute_tool() —— 纯函数，不写日志
-│   ├── model.py           # model_output 解析 + 模型错误处理
-│   └── lifecycle.py       # finish_run() —— 统一的退出路径
-│
-├── guard/                 # 安全约束（五级门链）
-│   ├── permissions.py
-│   ├── policy.py
-│   ├── profiles.py
-│   ├── repetition.py
-│   └── sandbox/
-│
-├── context/               # 上下文治理
-│   ├── assemble.py        # prompt 拼装 + 预算控制
-│   ├── compact.py         # 历史压缩
-│   └── render.py          # TurnHistoryBuilder
-│
-├── memory/                # 记忆系统
-│   ├── store.py           # LayeredMemory CRUD
-│   ├── fresh.py           # file_freshness, invalidate_stale
-│   ├── recall.py          # retrieval, render
-│   └── durable.py         # DurableMemoryStore, dream
-│
-├── life/                  # 生命周期管理
-│   ├── checkpoint.py      # create_checkpoint, evaluate_resume_state
-│   ├── resume.py          # resume/clear session
-│   └── plan.py            # PlanModeController
-│
-├── trace/                 # 可观测基建
-│   ├── bus.py             # Audit 统一入口
-│   ├── span.py            # TraceEvent 构建
-│   ├── consumers.py       # ArtifactGraph + Verifier + Reminder
-│   └── report.py          # build_report, write_report
-│
-├── skills/                # 不变
-├── workers/               # 不变
-├── agent.py               # 组合根（~100 行）
-├── cli.py
-└── testing.py
+cli.py → Agent.ask_stream()
+           │  ctx.start_turn()
+           └→ Engine.run_stream(model_client, executor, ctx, bus, query, ...)
+                │  9 个参数
+                │  内部创建 TaskState、RepetitionDetector
+                │  内部调 ctx.append_assistant() / append_tool_result()
+                │  yield 裸 dict
+                └→ cli.py for 循环消费
 ```
 
-## 依赖方向
+## 目标架构
 
 ```
-                    cli.py / tui/
-                         │
-                    agent.py  ← 组合根
-                    /  |  \   \
-                   /   |   \   \
-          engine/  context/  guard/  life/  trace/
-           /  \       \       /      /      /
-          /    \       \     /      /      /
-    memory/  tools/  skills/  workers/  providers/
-          \     \       \     /        /
-           \     \       \   /        /
-            └─────┴───┴───┴─────────┘
-                      │
-                    data/    ← 被所有层依赖
+cli.py → AgentSession.prompt("query")
+           │  subscribe(ui_handler)
+           │  /command → 扩展命令
+           │  skill/template 展开
+           │  扩展 input 钩子
+           │  装配 AgentMessage[]
+           │  设置 system prompt
+           │
+           └→ Agent.prompt(messages)
+                │  状态快照：{ systemPrompt, messages, tools }
+                │  广播事件：subscribe() → AgentSession._handle_event()
+                │                     → 持久化 / 扩展 / UI
+                │
+                └→ Loop.run_stream(model_client, tools, messages, system_prompt,
+                │                  convert_to_llm, options)
+                │     纯循环：调 LLM → 执行工具 → emit 事件
+                │     不知道持久化、UI、扩展的存在
+                │
+                └→ yield 类型化事件 ← Agent.process_events() 消费
 ```
 
-- data/ 不被任何其他 pico 模块引用
-- guard/ 不依赖 agent.py（打破原来的循环依赖）
-- engine/ 不直接写日志，通过 Audit 实例
-- trace/ 只被 engine/ 和 agent.py 调用
+---
 
-## 数据结构改进
+## 第一步：定义统一消息类型
 
-### Session：裸 dict → dataclass
+**现状**：`list[dict]` 裸字典，key 名跟随 OpenAI 格式。
+
+**改为**：dataclass + Union 类型，内部统一用 `AgentMessage`，LLM 边界用 `convert_to_llm` 转换。
 
 ```python
+# data/messages.py
+
 @dataclass
-class Session:
+class TextContent:
+    type: Literal["text"] = "text"
+    text: str
+
+@dataclass
+class ToolCallContent:
+    type: Literal["tool_call"] = "tool_call"
     id: str
-    created_at: str
-    workspace_root: str
-    history: list = field(default_factory=list)
-    memory: MemoryState = field(default_factory=MemoryState)
-    checkpoints: CheckpointStore = field(default_factory=CheckpointStore)
-    runtime_identity: RuntimeIdentity = field(default_factory=RuntimeIdentity)
-    resume_state: ResumeState = field(default_factory=ResumeState)
-    runtime_mode: RuntimeMode = field(default_factory=RuntimeMode)
-    todos: TodoState = field(default_factory=TodoState)
-    workers: WorkerState = field(default_factory=WorkerState)
-    compactions: list = field(default_factory=list)
-```
+    name: str
+    arguments: dict
 
-### MemoryState：删掉旧格式镜像
-
-```python
 @dataclass
-class MemoryState:
-    task_summary: str = ""
-    recent_files: list[str] = field(default_factory=list)
-    episodic_notes: list[EpisodicNote] = field(default_factory=list)
-    file_summaries: dict[str, FileSummary] = field(default_factory=dict)
-    next_note_index: int = 0
-    # 删掉 task, files, notes
-```
+class Message:
+    role: Literal["user", "assistant", "tool_result"]
+    content: list[TextContent | ToolCallContent]
+    timestamp: int
 
-### Checkpoint：14 → 7 个字段
-
-```python
 @dataclass
-class Checkpoint:
-    checkpoint_id: str
-    parent_checkpoint_id: str = ""
-    schema_version: str = "phase1-v2"
-    created_at: str = field(default_factory=now)
-    current_goal: str = ""                  # 必须持久化（resume 时 prompt 已不在）
-    key_files: list[KeyFile] = field(default_factory=list)  # 必须持久化（freshness 校验）
-    runtime_identity: RuntimeIdentity = field(default_factory=RuntimeIdentity)  # 必须持久化
-    # 删掉：completed, excluded, current_blocker, next_step, summary, freshness
-    # 这些从 TaskState 实时计算
+class AssistantMessage(Message):
+    role: Literal["assistant"] = "assistant"
+    api: str = ""
+    provider: str = ""
+    model: str = ""
+    stop_reason: str = "stop"
+    usage: Usage | None = None
+    error_message: str | None = None
+
+# 扩展：用 Union 类型增加应用层自定义消息
+# AgentMessage = Message | BashExecutionMessage | CustomMessage | CompactionSummaryMessage
+
+# context/convert_to_llm.py
+def convert_to_llm(messages: list[AgentMessage]) -> list[dict]:
+    """AgentMessage → OpenAI-compatible dict。
+    bash_execution → user, compaction_summary → user,
+    custom → user, user/assistant/tool → 透传。
+    """
 ```
 
-### TraceEvent：setdefault → dataclass
+### 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| 新建 `src/data/messages.py` | 定义 Message、AgentMessage、AssistantMessage 等 |
+| 新建 `src/context/convert_to_llm.py` | convert_to_llm 函数 |
+| 全局搜索 `role": "tool"` 替换为 `role: "tool_result"` | 统一角色名 |
+
+---
+
+## 第二步：Loop 纯函数化
+
+**现状**：`Engine.run_stream()` 是静态方法，9 个参数，内部混入 TaskState、RepetitionDetector、文件变更检测、ctx.append_*。
+
+**改为**：类似 pi 的 `agent-loop.ts`——只调 LLM + 执行工具 + emit 事件。
 
 ```python
+# engine/loop.py
+
 @dataclass
-class TraceEvent:
-    event: str
-    phase: str = "runtime"
-    trace_id: str = ""
-    span_id: str = ""
-    parent_span_id: str = ""
-    duration_ms: int = 0
-    input_chars: int = 0
-    output_chars: int = 0
-    # 不需要 setdefault 补默认值
+class LoopOptions:
+    max_steps: int = 100
+    max_tool_steps: int = 100
+    max_new_tokens: int = 8192
+    signal: asyncio.Event | None = None
+
+# 事件类型（纯数据，不包含如何消费的指令）
+@dataclass
+class TextDelta:
+    content_index: int
+    delta: str
+
+@dataclass
+class ToolCallStart:
+    content_index: int
+    tool_call: ToolCallContent
+
+@dataclass
+class ToolCallEnd:
+    content_index: int
+    tool_call: ToolCallContent
+
+@dataclass
+class Done:
+    message: AssistantMessage
+
+@dataclass
+class Error:
+    message: str
+
+LoopEvent = TextDelta | ReasoningDelta | ToolCallStart | ToolCallDelta | ToolCallEnd | Done | Error
+
+class Loop:
+    """无状态循环内核。不知道消息格式、不知道持久化、不知道 UI。"""
+
+    @staticmethod
+    async def run_stream(
+        model_client: ModelClient,
+        tools: dict[str, Tool],
+        messages: list[dict],
+        system_prompt: str,
+        *,
+        convert_to_llm: Callable,
+        options: LoopOptions | None = None,
+    ) -> AsyncGenerator[LoopEvent, None]:
+        """纯循环：调 LLM → 执行工具 → 回到调 LLM。
+
+        Yields 类型化事件供调用方处理。
+        最后 yield Done(message) 或 Error(message)。
+        """
 ```
 
-## 可观测统一
+### 具体变化
+
+| 当前 Engine.run_stream() | 改为 |
+|---|---|
+| 接收 9 个参数 | 接收 6 个：model_client, tools, messages, system_prompt, convert_to_llm, options |
+| 内部 new TaskState() | 移到 AgentSession |
+| 内部 new RepetitionDetector() | 移到 AgentSession，通过 tool_call 钩子注入 |
+| ctx.append_assistant() | 追加到 messages 列表，由调用方管理 |
+| ctx.append_tool_result() | 同上 |
+| yield {"type": "reasoning", ...} | yield ReasoningDelta(...) |
+| yield {"type": "tool_call", ...} | yield ToolCallStart(...) / ToolCallEnd(...) |
+| yield {"type": "final", ...} | yield Done(message=AssistantMessage(...)) |
+| 异常 yield {"type": "error"} | yield Error(message=...) |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/engine/loop.py` | 重写为纯函数 Loop.run_stream() |
+| `src/engine/executor.py` | ToolExecutor 改为纯执行器，不包含重试/审批逻辑 |
+| 新建 `src/engine/events.py` | 定义 LoopEvent 联合类型 |
+
+---
+
+## 第三步：Agent（状态机 + 事件源）
+
+**现状**：没有独立的状态机，状态散落在 Agent 类 + Engine 局部变量 + ContextManager 中。
+
+**改为**：新建 Agent 类（类似 pi 的 `agent.ts`），管理状态 + 事件广播。
 
 ```python
-# trace/bus.py
-class Audit:
-    def __init__(self, event_bus, run_store, task_state=None):
-        self.event_bus = event_bus
-        self.run_store = run_store
-        self.task_state = task_state
+# engine/agent.py
 
-    def emit(self, event: str, **kwargs):
-        payload = {"event": event, "created_at": now(), **kwargs}
-        self.event_bus.emit(event, payload)
-        if self.task_state:
-            self._append_trace(event, payload)
-
-    def with_task(self, task_state):
-        return Audit(self.event_bus, self.run_store, task_state)
-```
-
-engine/loop.py 中每条 log 调用：
-
-```
-turn 开始      → audit.emit("turn_started", run_id=..., task_id=...)
-prompt 构建    → audit.emit("prompt_built", metadata=...)
-模型调用       → audit.emit("model_requested", attempts=...)
-工具开始       → audit.emit("tool_started", name=name, args=args)
-工具完成       → audit.emit("tool_finished", name=name, status=...)
-checkpoint     → audit.emit("checkpoint_created", trigger=..., id=...)
-最终回答       → audit.emit("assistant_message", kind="final", content=...)
-run 结束       → audit.emit("run_finished", status=...)
-turn 结束      → audit.emit("turn_finished", status=..., duration=...)
-```
-
-## 分阶段实施（围绕 agent loop 递增）
-
-### 阶段 1：裸 Loop
-
-**目标**：能发 prompt 给模型，拿到文本回来。
-
-```
-输入 → prompt → 模型 → 文本 → 返回
-```
-
-新增文件：agent.py, engine/loop.py, engine/model.py, data/task.py
-已有：providers/, workspace.py
-
-### 阶段 2：Loop + 工具执行
-
-**目标**：模型能调用工具，执行后把结果喂回去。
-
-```
-输入 → prompt → 模型 → 解析（tool/final）
-                         │
-                    tool → 五级门链 → 执行 → 结果追加到历史 → 回到 prompt
-                         │
-                   final → 返回
-```
-
-新增文件：guard/, engine/tool.py, tools/
-新增到 data/：按需加 schema 相关 dataclass
-
-### 阶段 3：Loop + 工具 + 上下文治理
-
-**目标**：prompt 超限时自动压缩。
-
-新增文件：context/, data/session.py
-
-### 阶段 4：Loop + 工具 + 上下文 + 记忆
-
-**目标**：agent 跨 turn 记住做了什么。
-
-新增文件：memory/store.py, memory/fresh.py, memory/recall.py, data/memory.py
-更新：guard/policy.py（prior_read_required）
-
-### 阶段 5：Loop + 工具 + 上下文 + 记忆 + 断点续跑
-
-**目标**：session 关掉后，下次启动能接着做。
-
-新增文件：life/checkpoint.py, life/resume.py, data/checkpoint.py, data/identity.py
-
-### 阶段 6：Loop + 工具 + 上下文 + 记忆 + 续跑 + 可观测
-
-**目标**：所有 agent 行为可追溯。
-
-新增文件：trace/, data/trace.py, data/events.py
-
-### 阶段 7：外挂
-
-skills/, workers/, life/plan.py, memory/durable.py
-
-## agent.py 组合根（~100 行）
-
-```python
 class Agent:
-    def __init__(self, model_client, workspace, session_store, *, session=None, ...):
-        self.session = session or Session.create()
-        self.workspace = workspace
-        self.model_client = model_client
-        self.session_store = session_store
-        self.memory = LayeredMemory(self.session.memory, workspace.root)
-        self.engine = Engine(self)
-        self.context_assembler = ContextAssembler(self)
-        self.tools = build_tools(self)
-        self.tool_profile = select_profile(...)
-        self.permission_checker = PermissionChecker()
-        self.tool_policy_checker = ToolPolicyChecker()
-        self.event_bus = EventBus(self.session.id, ...)
-        self.run_store = RunStore(workspace.root)
+    """状态机 + 事件源。不知道 AgentSession 的存在。"""
 
-    def ask(self, message: str) -> str:
-        return self.engine.ask(message)
+    def __init__(self, *, convert_to_llm, stream_fn, ...):
+        self._state = {
+            "system_prompt": "",
+            "messages": [],
+            "tools": [],
+            "model": None,
+            "is_streaming": False,
+        }
+        self._listeners: set[Callable] = set()
+        self._steering_queue: list[AgentMessage] = []
+        self._follow_up_queue: list[AgentMessage] = []
 
-    def run_turn(self, user_message):
-        return self.engine.run_turn(user_message)
+    def subscribe(self, listener) -> Callable:
+        self._listeners.add(listener)
+        return lambda: self._listeners.remove(listener)
+
+    async def prompt(self, messages: list[AgentMessage]):
+        """新的一轮：拍快照 → 调 Loop.run_stream() → 广播事件。"""
+
+    async def continue_(self):
+        """恢复：最后一条消息不是 assistant 时触发。"""
+
+    def steer(self, message: AgentMessage): ...
+    def follow_up(self, message: AgentMessage): ...
+    def abort(self): ...
+    async def wait_for_idle(self): ...
+
+    @property
+    def state(self) -> dict: ...
+
+    def _process_event(self, event):
+        """reduce state + broadcast to listeners。"""
 ```
 
-## engine/loop.py 关键结构
+### 关键设计
 
 ```python
-def run_turn(self, user_message):
-    task_state = TaskState.create(user_message)
-    audit = self.agent.make_audit(task_state)
+async def prompt(self, messages):
+    context_snapshot = {
+        "system_prompt": self._state["system_prompt"],
+        "messages": list(self._state["messages"]) + list(messages),
+        "tools": list(self._state["tools"]),
+    }
 
-    audit.emit("turn_started", run_id=task_state.run_id, ...)
-    audit.emit("run_started", task_id=..., user_request=...)
-
-    record_user_message(user_message)
-    update_memory_task_summary(user_message)
-
-    tool_steps = 0
-    attempts = 0
-    max_attempts = max_steps + 2
-
-    while tool_steps < max_steps and attempts < max_attempts:
-        if abort_requested:
-            yield from finish_run(self, task_state, ..., stop_reason="aborted")
-            return
-
-        # checkpoint 触发判断
-        prompt, metadata = build_prompt(user_message)
-        audit.emit("prompt_built", metadata=metadata)
-        if metadata.resume_status == "partial-stale":
-            checkpoint = create_checkpoint(task_state, trigger="freshness_mismatch")
-            audit.emit("checkpoint_created", id=checkpoint.id, trigger="freshness_mismatch")
-
-        # 调用模型
-        result = complete_model(model_client, prompt, max_tokens)
-        kind, payload = parse(result.text)
-        audit.emit("model_parsed", kind=kind, duration_ms=...)
-
-        # 路由
-        if kind == "tool":
-            audit.emit("tool_started", name=payload.name, args=payload.args)
-            tool_result = execute_tool(agent, payload.name, payload.args)
-            audit.emit("tool_finished", name=tool_result.name, status=tool_result.status, ...)
-            audit.emit("tool_executed", ...)
-            checkpoint = create_checkpoint(task_state, trigger="tool_executed")
-            audit.emit("checkpoint_created", id=checkpoint.id, trigger="tool_executed")
-            tool_steps += 1
-            continue
-
-        if kind == "final":
-            record_in_history("assistant", payload)
-            promote_durable_memory(user_message, payload)
-            maintain_memory(payload)
-            checkpoint = create_checkpoint(task_state, trigger="run_finished")
-            audit.emit("checkpoint_created", id=checkpoint.id, trigger="run_finished")
-            audit.emit("run_finished", status="completed", ...)
-            audit.emit("turn_finished", status="completed", ...)
-            write_report(task_state)
-            yield {"type": "final", "content": payload}
-            return
-
-    # 预算耗尽
-    yield from finish_run(self, task_state, ..., stop_reason="step_limit_reached")
+    async for event in Loop.run_stream(
+        self._model_client,
+        self._state["tools"],
+        context_snapshot["messages"],
+        context_snapshot["system_prompt"],
+        convert_to_llm=self._convert_to_llm,
+    ):
+        self._process_event(event)  # reduce state + 广播
 ```
 
-## 与原结构对应
+### 涉及文件
 
-| 原来 | 重构后 |
-|------|--------|
-| core/runtime.py（939 行 God Object） | agent.py（~100 行）+ 逻辑分散到各层 |
-| core/engine.py + engine_helpers.py + model_errors.py | engine/loop.py + tool.py + model.py + lifecycle.py |
-| core/session.py 不存在 | data/session.py（dataclass） |
-| core/permissions.py + tool_policy.py + tool_profiles.py + tool_repetition.py + tool_executor.py | guard/ 下 5 个文件 + engine/tool.py 的 execute_tool() |
-| core/session_events.py + runtime_events.py + runtime_consumers.py + artifacts.py | trace/ 下 4 个文件 |
-| features/memory.py（1375 行） | memory/ 下 4 个文件 |
-| core/runtime_checkpoints.py | life/checkpoint.py |
-| core/session_lifecycle.py | life/resume.py |
-| core/context_manager.py + compact.py + turn_history.py | context/ 下 3 个文件 |
-| providers/ | 不变 |
-| tools/ | 不变 |
-| cli.py + tui/ | 不变 |
+| 文件 | 改动 |
+|---|---|
+| 新建 `src/engine/agent.py` | Agent 类 |
+| `src/agent.py` 中的 Agent 类改名 | 改为 AgentSession，或新建 |
+
+---
+
+## 第四步：AgentSession（应用逻辑层）
+
+**现状**：`Agent` 类既管组合根又管业务逻辑（mode、plan、_pending_plan）。
+
+**改为**：AgentSession 封装所有应用层逻辑。
+
+```python
+# session.py 或 agent.py（保留文件名但重写）
+
+class AgentSession:
+    """应用逻辑层。装配 prompt、管理扩展、重试、压缩、持久化。"""
+
+    def __init__(self, workspace_root, approval_policy, ...):
+        # ── 先创建底层依赖 ──
+        self._model_client = ModelClient(...)
+        self._tool_registry = self._build_tool_registry()
+        self._agent = Agent(convert_to_llm=convert_to_llm, stream_fn=..., ...)
+        self._agent.subscribe(self._handle_event)  # ← 监听事件
+
+        # ── 应用状态 ──
+        self.mode = "default"
+        self.topic = ""
+        self.plan_path = ""
+
+    def _build_tool_registry(self):
+        """创建工具定义，写入 Agent.state.tools。"""
+        registry = ToolRegistry()
+        registry.register(create_read_tool(...))
+        registry.register(create_write_tool(...))
+        registry.register(create_bash_tool(...))
+        registry.register(create_patch_tool(...))
+        self._agent.state.tools = registry.get_active_tools()
+        return registry
+
+    async def prompt(self, query: str):
+        """完整的装配管线。"""
+        # 1. 预处理
+        if query.startswith("/"):
+            if self._try_extension_command(query):
+                return
+
+        # 2. input 钩子（扩展可转换/拦截）
+        # ...
+
+        # 3. skill/template 展开
+        expanded = self._expand_skill(query)
+        expanded = expand_template(expanded, ...)
+
+        # 4. 装配 AgentMessage[]
+        messages = [UserMessage(content=expanded)]
+        messages.extend(self._pending_next_turn_messages)
+        # ...
+
+        # 5. system prompt
+        self._agent.state.system_prompt = build_system_prompt(
+            workspace_root=self._cwd,
+            tools=self._tool_registry.get_definitions(),
+            mode=self.mode,
+        )
+
+        # 6. 交给 Agent
+        await self._agent.prompt(messages)
+
+    async def _handle_event(self, event):
+        """同一事件处理多件事。"""
+        # 转发给扩展
+        # 转发给 UI（通过自己的 subscribe）
+        if event.type == "message_end":
+            self._persist(event.message)
+        if event.type == "agent_end":
+            if self._should_retry(event):
+                await self._retry(event)
+            if self._should_compact(event):
+                await self._compact(event)
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/agent.py` | 重写为 AgentSession |
+| `src/cli.py` | 改为调用 session.prompt() + subscribe(ui_handler) |
+| 新建 `src/core/system_prompt.py` | build_system_prompt() 纯函数 |
+| 新建 `src/core/session_persistence.py` | JSONL 持久化 |
+
+---
+
+## 第五步：事件订阅机制
+
+**现状**：`cli.py` 用 `for event in agent.ask_stream(query)` 消费事件，UI 渲染和业务逻辑混在 for 循环体里。
+
+**改为**：Agent 通过 `subscribe()` 广播事件，消费方注册 listener。
+
+```python
+# cli.py
+
+session = AgentSession(workspace_root="...")
+
+# 注册 UI 监听器
+unsub = session.subscribe(ui_handler)
+
+# 一行提交，不需要自己写循环
+await session.prompt("帮我看看这个文件")
+
+# ui_handler 收到所有事件自动渲染
+def ui_handler(event):
+    if isinstance(event, TextDelta):
+        sys.stdout.write(event.delta)
+    elif isinstance(event, ToolCallStart):
+        print(f"\n工具调用: {event.tool_call.name}")
+    elif isinstance(event, Done):
+        print(f"\n完成: {event.message.content}")
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/cli.py` | 删除 for 循环，改为 subscribe + 单次 prompt |
+| `src/agent.py` | AgentSession.subscribe() 和 _handle_event() |
+
+---
+
+## 第六步：ToolRegistry + 钩子系统
+
+**现状**：`build_registry()` 硬编码，`ToolExecutor` 管所有。
+
+**改为**：ToolRegistry 只注册和查询，执行由 Agent 触发。
+
+```python
+# tools/registry.py
+
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict       # JSON Schema
+    execute: Callable
+    risky: bool = False
+
+class ToolRegistry:
+    def __init__(self):
+        self._tools: dict[str, ToolDefinition] = {}
+
+    def register(self, tool: ToolDefinition): ...
+    def get_schemas(self) -> list[dict]: ...
+    def execute(self, name: str, args: dict) -> ToolResult: ...
+    def is_allowed(self, name: str, mode: str) -> bool: ...
+```
+
+钩子系统（ExtensionRunner）：
+
+```python
+# core/extension_runner.py
+
+class ExtensionRunner:
+    def __init__(self):
+        self._handlers: dict[str, list[Callable]] = {}
+
+    def on(self, event: str, handler: Callable): ...
+    def emit(self, event: str, data: dict) -> Any: ...
+
+# 使用示例：plan mode 的 tool 限制
+runner.on("tool_call", _plan_mode_tool_check)
+runner.on("before_agent_start", _plan_mode_prompt_inject)
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/tools/__init__.py` | 改为用 ToolRegistry 注册 |
+| 删除 `src/engine/executor.py` | 功能分散到 ToolRegistry + 钩子 |
+| 新建 `src/tools/registry.py` | ToolRegistry 类 |
+| 新建 `src/core/extension_runner.py` | ExtensionRunner 类 |
+
+---
+
+## 第七步：持久化改为 JSONL
+
+**现状**：每个 session 一个目录，内含 session.json、events.jsonl、task_state.json、history.jsonl 等。
+
+**改为**（可选，逐步迁移）：pi 风格的 append-only JSONL + parentId 树结构。
+
+```python
+# data/session_store.py
+
+class SessionStore:
+    """Append-only JSONL with parentId branching."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._entries: list[dict] = []
+
+    def append(self, entry: dict):
+        entry["id"] = uuid7()
+        entry["parent_id"] = self._entries[-1]["id"] if self._entries else None
+        entry["timestamp"] = now()
+        self._entries.append(entry)
+        append_to_jsonl(self._path, entry)
+
+    def build_context(self) -> list[AgentMessage]:
+        """回放所有 message 类型条目，重建消息列表。"""
+```
+
+---
+
+## 执行顺序
+
+| 步骤 | 改动内容 | 独立验证 |
+|---|---|---|
+| 1 | 定义 Message dataclass，创建 convert_to_llm | 可以逐步替换现有 list[dict] |
+| 2 | Loop 纯函数化（engine/loop.py） | 可用单元测试验证输入/输出 |
+| 3 | 新建 Agent（状态机 + 事件源） | 旧 Agent 改名为 AgentSession，新建 Agent 独立 |
+| 4 | AgentSession 重写 prompt() 管线 | CLI 层暂时保留 for 循环兼容 |
+| 5 | subscribe 机制，CLI 改用事件监听 | 最后改 CLI，之前不变 |
+| 6 | ToolRegistry + ExtensionRunner | 逐步替换 ToolExecutor |
+| 7 | JSONL 持久化 | 最后可选 |
+
+每一步的验证方式：
+1. 运行 `pytest tests/` 确保现有测试不失败
+2. 手动跑 `python -m src.cli "hello"` 确保基本对话功能正常
+3. 逐步打开断言/类型检查确保新代码覆盖旧代码路径

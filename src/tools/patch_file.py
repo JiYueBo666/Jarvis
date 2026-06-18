@@ -34,7 +34,10 @@ class PatchFile(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
-        path = resolve_path(parameters["path"], self.workspace_root)
+        try:
+            path = resolve_path(parameters["path"], self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
         old_text = str(parameters["old_text"])
         new_text = str(parameters.get("new_text", ""))
 

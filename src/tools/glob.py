@@ -27,7 +27,10 @@ class GlobTool(Tool):
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
         pattern = parameters["pattern"]
-        search_root = resolve_path(parameters.get("path", "."), self.workspace_root)
+        try:
+            search_root = resolve_path(parameters.get("path", "."), self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
 
         if not search_root.is_dir():
             return ToolResult(output=f"Error: directory not found: {search_root}")

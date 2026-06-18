@@ -100,6 +100,37 @@ class ApprovalRequired:
             )
 
 
+# ── 上下文压缩 ──
+
+
+@dataclass
+class CompactionStart:
+    """上下文压缩开始。"""
+
+
+@dataclass
+class CompactionEnd:
+    """上下文压缩完成。"""
+
+    messages_before: int
+    messages_after: int
+
+
+# ── 自动重试 ──
+
+
+@dataclass
+class RetryStart:
+    """自动重试开始（rate limit / server error 等）。"""
+
+
+@dataclass
+class RetryEnd:
+    """自动重试完成。"""
+
+    success: bool
+
+
 # ── Union 类型 ──
 
 AgentEvent = (
@@ -113,4 +144,8 @@ AgentEvent = (
     | ToolExecutionStart
     | ToolExecutionEnd
     | ApprovalRequired
+    | CompactionStart
+    | CompactionEnd
+    | RetryStart
+    | RetryEnd
 )

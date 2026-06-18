@@ -7,6 +7,7 @@ import asyncio
 import itertools
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -30,9 +31,15 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
 from src.AgentSession.agent_session import AgentSession
+from src.config import settings
+from src.context.session_manager import SessionManager
 from src.data.event import (
     AgentEnd,
     ApprovalRequired,
+    CompactionEnd,
+    CompactionStart,
+    RetryEnd,
+    RetryStart,
     MessageEnd,
     MessageStart,
     MessageUpdate,
@@ -45,9 +52,6 @@ from src.engine.model import ModelClient
 from src.tools import build_registry
 from loguru import logger as log
 
-_reasoning_active = False
-
-
 PRICING = {
     "deepseek-chat": (0.27, 1.10),
     "deepseek-reasoner": (0.55, 2.19),
@@ -56,7 +60,9 @@ PRICING = {
 
 class Spinner:
     def __init__(self, message: str = ""):
-        self._chars = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+        self._chars = itertools.cycle(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        )
         self._message = message
         self._running = False
         self._thread: threading.Thread | None = None
@@ -96,22 +102,102 @@ def _extract_usage(msg) -> Usage | None:
     return None
 
 
-def _render_text_delta(text: str):
-    sys.stdout.write(text)
-    sys.stdout.flush()
+def _close_panels():
+    global _thinking_panel, _text_panel, _reasoning_active
+    if _thinking_panel:
+        _thinking_panel.end()
+        _thinking_panel = None
+    if _text_panel:
+        _text_panel.end()
+        _text_panel = None
+    _reasoning_active = False
+
+
+def _term_width():
+    try:
+        return shutil.get_terminal_size().columns
+    except OSError:
+        return 80
+
+
+class StreamPanel:
+    """Streaming text panel with top/bottom borders and optional background.
+
+    Handles arbitrary text chunks by splitting on newlines. Completed lines
+    get full-width background via \\033[K (erase-to-end-of-line honors bg color).
+    """
+
+    def __init__(self, title: str = "", bg: str = "", fg: str = ""):
+        self.title = title
+        self.bg = bg
+        self.fg = fg
+        self._open = False
+        self._at_line_start = True
+
+    def _codes(self) -> str:
+        c = ""
+        if self.bg:
+            c += f"\033[{self.bg}m"
+        if self.fg:
+            c += f"\033[{self.fg}m"
+        return c
+
+    def start(self):
+        w = _term_width()
+        label = f" {self.title} " if self.title else ""
+        fill = "\u2500" * max(0, w - 2 - len(label))
+        sys.stdout.write(f"  \u250c{label}{fill}\n")
+        sys.stdout.flush()
+        self._open = True
+        self._at_line_start = True
+
+    def write(self, text: str):
+        if not self._open:
+            self.start()
+        if not text:
+            return
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            is_last = i == len(parts) - 1
+            if self._at_line_start and (part or not is_last):
+                sys.stdout.write(f"  \u2502 {self._codes()}")
+                self._at_line_start = False
+            if part:
+                sys.stdout.write(part)
+            if not is_last:
+                if self.bg:
+                    sys.stdout.write(f"\033[{self.bg}m\033[K")
+                sys.stdout.write("\033[0m\n")
+                self._at_line_start = True
+        sys.stdout.flush()
+
+    def end(self):
+        if not self._open:
+            return
+        if not self._at_line_start:
+            if self.bg:
+                sys.stdout.write(f"\033[{self.bg}m\033[K")
+            sys.stdout.write("\033[0m\n")
+        w = _term_width()
+        fill = "\u2500" * max(0, w - 2)
+        sys.stdout.write(f"  \u2514{fill}\n")
+        sys.stdout.flush()
+        self._open = False
+
+
+_reasoning_active = False
+_thinking_panel: StreamPanel | None = None
+_text_panel: StreamPanel | None = None
 
 
 def _render_event(event):
-    global _reasoning_active
+    global _reasoning_active, _thinking_panel, _text_panel
 
     if isinstance(event, TurnStart):
         _dim(f"  ── 模型调用 ──")
 
     elif isinstance(event, MessageStart):
-        msg = event.message
-        if msg.role == "assistant":
-            # assistant 消息开始，启动思考/文本流渲染状态会在 content 到达时处理
-            pass
+        pass
 
     elif isinstance(event, MessageUpdate):
         msg = event.message
@@ -120,32 +206,32 @@ def _render_event(event):
                 if isinstance(block, ThinkingContent):
                     if not _reasoning_active:
                         _reasoning_active = True
-                        sys.stdout.write("  🧠 \033[90m")
-                    sys.stdout.write(block.thinking)
-                    sys.stdout.flush()
+                        _thinking_panel = StreamPanel(
+                            title="\U0001f9e0 思考", bg="48;5;237", fg="38;5;248"
+                        )
+                        _thinking_panel.start()
+                    _thinking_panel.write(block.thinking)
                 elif isinstance(block, TextContent):
                     if _reasoning_active:
-                        sys.stdout.write("\033[0m\n")
-                        sys.stdout.flush()
+                        if _thinking_panel:
+                            _thinking_panel.end()
+                            _thinking_panel = None
                         _reasoning_active = False
-                    sys.stdout.write(block.text)
-                    sys.stdout.flush()
+                    if not _text_panel:
+                        _text_panel = StreamPanel()
+                        _text_panel.start()
+                    _text_panel.write(block.text)
 
     elif isinstance(event, MessageEnd):
         msg = event.message
         if msg.role == "assistant":
-            if _reasoning_active:
-                sys.stdout.write("\033[0m\n")
-                _reasoning_active = False
-            else:
-                print(flush=True)
+            _close_panels()
 
     elif isinstance(event, ToolExecutionStart):
         intent = event.args.get("intent", "")
         _tool_line(event.tool_name, intent, _compact_args(event.args))
 
     elif isinstance(event, ToolExecutionEnd):
-        # tool_result 消息的内容是 TextContent 列表
         output = ""
         for block in getattr(event.result, "content", []) or []:
             if isinstance(block, TextContent):
@@ -156,33 +242,62 @@ def _render_event(event):
     elif isinstance(event, ApprovalRequired):
         _handle_approval(event)
 
-    elif isinstance(event, AgentEnd):
-        if _reasoning_active:
-            sys.stdout.write("\033[0m\n")
-            _reasoning_active = False
+    elif isinstance(event, CompactionStart):
+        _close_panels()
+        _dim(f"  ⏳ 正在压缩对话历史...")
+
+    elif isinstance(event, CompactionEnd):
+        _dim(
+            f"  ✅ 压缩完成: {event.messages_before} → {event.messages_after} 条"
+        )
+
+    elif isinstance(event, RetryStart):
+        _close_panels()
+        _dim(f"  🔄 正在重试...")
+
+    elif isinstance(event, RetryEnd):
+        if event.success:
+            _dim(f"  ✅ 重试成功")
         else:
-            print(flush=True)
+            _dim(f"  ❌ 重试失败")
+
+    elif isinstance(event, AgentEnd):
+        _close_panels()
 
 
 def _tool_line(name: str, intent: str, args_str: str):
     if intent:
         print(f"  \033[2m▶\033[0m \033[37m{intent}\033[0m", flush=True)
-    print(f"  \033[36m⚙ {name}\033[0m({args_str})" if args_str else f"  \033[36m⚙ {name}\033[0m", flush=True)
+    print(
+        (
+            f"  \033[36m⚙ {name}\033[0m({args_str})"
+            if args_str
+            else f"  \033[36m⚙ {name}\033[0m"
+        ),
+        flush=True,
+    )
 
 
 def _handle_approval(event: ApprovalRequired):
     name = event.tool_name
     intent = event.args.get("intent", "")
     args = _compact_args(event.args)
+    inner = _term_width() - 4
     print()
-    print(f"  \033[33m┌─── 🛡️  审批请求 ───────────────────────────┐\033[0m")
+    print(f"  \033[33m┌─── 🛡️  审批请求 {'─' * (inner - 12)}┐\033[0m")
     if intent:
         print(f"  \033[33m│\033[0m  \033[37m▶ {intent}\033[0m")
-    print(f"  \033[33m│\033[0m  \033[1m{name}\033[0m({args})" if args else f"  \033[33m│\033[0m  \033[1m{name}\033[0m")
+    print(
+        f"  \033[33m│\033[0m  \033[1m{name}\033[0m({args})"
+        if args
+        else f"  \033[33m│\033[0m  \033[1m{name}\033[0m"
+    )
     print(f"  \033[33m│\033[0m  \033[2mY 允许本次  a 允许本轮  n 拒绝\033[0m")
-    print(f"  \033[33m└────────────────────────────────────────────┘\033[0m")
+    print(f"  \033[33m└{'─' * inner}┘\033[0m")
     try:
-        answer = input(f"  \033[33m你的选择\033[0m [\033[32mY\033[0m/n/a]: ").strip().lower()
+        answer = (
+            input(f"  \033[33m你的选择\033[0m [\033[32mY\033[0m/n/a]: ").strip().lower()
+        )
     except (EOFError, KeyboardInterrupt):
         answer = "n"
     if answer == "a":
@@ -194,9 +309,6 @@ def _handle_approval(event: ApprovalRequired):
     else:
         event.approve()
         print(f"  \033[32m✓ 已允许本次\033[0m")
-
-
-
 
 
 def _dim(text: str):
@@ -228,6 +340,7 @@ def _print_help():
     print("  命令:")
     print("    /exit, /quit          退出")
     print("    /help                 帮助")
+    print("    /sessions             列出历史会话")
     print()
     print("  启动:")
     print("    python main.py             新建会话")
@@ -238,6 +351,7 @@ class SlashCommandCompleter(Completer):
         "/exit": "退出程序",
         "/quit": "退出程序",
         "/help": "查看帮助",
+        "/sessions": "列出历史会话",
     }
 
     def get_completions(self, document, complete_event):
@@ -277,6 +391,7 @@ def bordered_prompt(
         if buf.text.lstrip().startswith("/"):
             try:
                 import asyncio
+
                 loop = asyncio.get_event_loop()
                 loop.call_soon(lambda: buf.start_completion(select_first=False))
             except RuntimeError:
@@ -286,6 +401,7 @@ def bordered_prompt(
 
     def _top():
         import os as _os
+
         try:
             w = _os.get_terminal_size().columns
         except OSError:
@@ -295,6 +411,7 @@ def bordered_prompt(
 
     def _bot():
         import os as _os
+
         try:
             w = _os.get_terminal_size().columns
         except OSError:
@@ -309,17 +426,19 @@ def bordered_prompt(
         return [("", "  ")]
 
     body = FloatContainer(
-        content=HSplit([
-            Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
-            Window(
-                BufferControl(buffer=buf),
-                get_line_prefix=_line_prefix,
-                height=Dimension(min=1),
-                dont_extend_height=True,
-                wrap_lines=True,
-            ),
-            Window(FormattedTextControl(_bot), dont_extend_height=True),
-        ]),
+        content=HSplit(
+            [
+                Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
+                Window(
+                    BufferControl(buffer=buf),
+                    get_line_prefix=_line_prefix,
+                    height=Dimension(min=1),
+                    dont_extend_height=True,
+                    wrap_lines=True,
+                ),
+                Window(FormattedTextControl(_bot), dont_extend_height=True),
+            ]
+        ),
         floats=[
             Float(
                 xcursor=True,
@@ -360,7 +479,7 @@ def bordered_prompt(
 slash_completer = SlashCommandCompleter()
 
 
-def _handle_command(query: str) -> str | None:
+def _handle_command(query: str, session: AgentSession | None = None) -> str | None:
     """Handle slash commands. Returns 'exit', 'handled', or None."""
     if not query.startswith("/"):
         return None
@@ -371,24 +490,51 @@ def _handle_command(query: str) -> str | None:
     if cmd == "/help":
         _print_help()
         return "handled"
+    if cmd == "/sessions":
+        if session is None:
+            _dim("无会话管理器")
+            return "handled"
+        sessions = session.list_sessions()
+        if not sessions:
+            _dim("没有保存的会话")
+        else:
+            print(f"  会话列表 ({len(sessions)}):")
+            for i, s in enumerate(sessions, 1):
+                _dim(f"  {i}. {s.session_id}  {s.title}  ({s.message_count} 条消息)")
+        return "handled"
     _dim(f"未知命令：{cmd}，输入 /help 查看可用命令")
     return "handled"
 
 
 def main():
     log.remove()
-    log.add(sys.stderr, format="<dim>{time:HH:mm:ss}</dim> | <level>{message}</level>", colorize=True)
-    log.add(".jarvis/logs/{time:YYYY-MM-DD}.log", rotation="1 day", retention=7, level="DEBUG")
+    log.add(
+        sys.stderr,
+        format="<dim>{time:HH:mm:ss}</dim> | <level>{message}</level>",
+        colorize=True,
+    )
+    log.add(
+        ".jarvis/logs/{time:YYYY-MM-DD}.log",
+        rotation="1 day",
+        retention=7,
+        level="DEBUG",
+    )
 
     workspace = os.getcwd()
-    model = os.environ.get("LLM_MODEL", os.environ.get("MODEL", "deepseek-chat"))
-    base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("BASE_URL", "https://api.deepseek.com/v1"))
-    api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("API_KEY", ""))
+    model = settings.SPEED_MODEL
+    base_url = settings.BASE_URL
+    api_key = settings.API_KEY
 
     model_client = ModelClient(model=model, base_url=base_url, api_key=api_key)
     system_prompt = "你是一个 helpful 的编程助手。"
     tools = list(build_registry(workspace_root=workspace).values())
-    session = AgentSession(model_client=model_client, system_prompt=system_prompt, tools=tools)
+    session_mgr = SessionManager(Path(workspace) / ".jarvis" / "sessions")
+    session = AgentSession(
+        model_client=model_client,
+        system_prompt=system_prompt,
+        tools=tools,
+        session_manager=session_mgr,
+    )
 
     _print_banner(model, workspace)
 
@@ -416,7 +562,7 @@ def main():
         if not query:
             continue
 
-        cmd_result = _handle_command(query)
+        cmd_result = _handle_command(query, session)
         if cmd_result == "exit":
             break
         if cmd_result:
@@ -479,13 +625,14 @@ def main():
             unsub()
             if spinner:
                 spinner.stop()
-            if _reasoning_active:
-                print(flush=True)
+            _close_panels()
 
         if prompt_tok or completion_tok:
             cost = _estimate_cost(model, prompt_tok, completion_tok)
-            _dim(f"  ├─ 输入 {prompt_tok:>6} tok | 输出 {completion_tok:>6} tok | "
-                 f"缓存 {cached_tok:>6} tok | 费用 ${cost:.4f}")
+            _dim(
+                f"  ├─ 输入 {prompt_tok:>6} tok | 输出 {completion_tok:>6} tok | "
+                f"缓存 {cached_tok:>6} tok | 费用 ${cost:.4f}"
+            )
         print(flush=True)
 
     loop.call_soon_threadsafe(loop.stop)

@@ -1,5 +1,7 @@
+import asyncio
 import time
 from typing import Callable
+
 from src.data.messages import (
     AssistantMessage,
     TextContent,
@@ -29,16 +31,21 @@ def _find_tool(tools: list[Tool], name: str) -> Tool | None:
     return None
 
 
-class Engine:
-    """纯编排。没有状态、没有初始化——只有 run()。"""
+_TOOL_TIMEOUT = 120
 
-    @staticmethod
+
+class Engine:
+    """编排循环。接收依赖后通过 run_stream 驱动 LLM + 工具调用。"""
+
+    def __init__(self, model_client: ModelClient, convert_to_llm: Callable):
+        self._model_client = model_client
+        self._convert_to_llm = convert_to_llm
+
     async def run_stream(
-        model_client: ModelClient,
+        self,
         tools: list[Tool],
         system_prompt: str,
         messages: list,
-        convert_to_llm: Callable,
         emit: Callable,
         before_tool_call: Callable | None = None,
         max_steps: int = 100,
@@ -53,12 +60,15 @@ class Engine:
             content_blocks = []
             usage = None
 
-            # 转换消息格式
-            llm_messages = convert_to_llm(current_messages)
+            llm_messages = self._convert_to_llm(current_messages)
             llm_messages.insert(0, {"role": "system", "content": system_prompt})
 
-            # 获取流式数据
-            async for block in model_client.stream_complete(
+            assistant_msg = AssistantMessage(
+                role="assistant", content=[], timestamp=time.time()
+            )
+            await emit(MessageStart(assistant_msg))
+
+            async for block in self._model_client.stream_complete(
                 llm_messages, max_new_tokens=8192, tools=schemas
             ):
                 if isinstance(block, (TextContent, ThinkingContent, ToolCallContent)):
@@ -75,17 +85,13 @@ class Engine:
                 elif isinstance(block, Usage):
                     usage = block
 
-            assistant_msg = AssistantMessage(
-                role="assistant",
-                content=content_blocks,
-                timestamp=time.time(),
-                usage=usage,
-            )
-            await emit(MessageStart(assistant_msg))
+            assistant_msg.content = content_blocks
+            assistant_msg.usage = usage
+            assistant_msg.timestamp = time.time()
             current_messages.append(assistant_msg)
             await emit(MessageEnd(assistant_msg))
 
-            # 获取工具调用
+            # 工具调用
             tool_calls = [b for b in content_blocks if isinstance(b, ToolCallContent)]
             tool_results: list[ToolResultMessage] = []
 
@@ -93,7 +99,6 @@ class Engine:
                 tool_fn = _find_tool(tools, tc.name)
                 await emit(ToolExecutionStart(tc.id, tc.name, tc.arguments))
 
-                # 执行前审批 hook
                 approved = True
                 denial_message = "Tool execution denied"
                 if before_tool_call is not None:
@@ -103,7 +108,12 @@ class Engine:
 
                 if approved:
                     if tool_fn is not None:
-                        output = tool_fn.run(tc.arguments)
+                        output = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, tool_fn.run, tc.arguments
+                            ),
+                            timeout=_TOOL_TIMEOUT,
+                        )
                         output_text = (
                             str(output) if not isinstance(output, str) else output
                         )

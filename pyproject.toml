@@ -9,7 +9,5 @@ dependencies = [
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
     "prompt-toolkit>=3.0.52",
-    "rich>=15.0.0",
-    "typer>=0.26.4",
     "loguru>=0.7.3",
 ]

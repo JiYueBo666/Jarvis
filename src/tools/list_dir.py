@@ -29,7 +29,10 @@ class ListDirTool(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
-        target = resolve_path(parameters["path"], self.workspace_root)
+        try:
+            target = resolve_path(parameters["path"], self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
         max_depth = min(int(parameters.get("max_depth", 1)), 3)
 
         if not target.is_dir():

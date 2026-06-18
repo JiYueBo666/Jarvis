@@ -17,6 +17,10 @@ class SandboxRunner:
 
     def run(self, command: str, timeout: int = 30) -> ToolResult:
         import subprocess
+        # WARNING: shell=True allows arbitrary command execution.
+        # This is intentional for run_shell (pipes, redirects, etc.)
+        # but requires the tool to be marked risky=True for approval.
+        # TODO: implement real sandbox isolation (seccomp, namespace, etc.)
         try:
             result = subprocess.run(
                 command,

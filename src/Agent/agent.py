@@ -30,7 +30,7 @@ class AgentState:
 class Agent:
     def __init__(self, model_client: ModelClient, before_tool_call=None):
         self._state = AgentState()
-        self._model_client: Optional[ModelClient] = model_client
+        self._engine = Engine(model_client=model_client, convert_to_llm=convert_to_llm)
         self._listeners: set = set()
         self._before_tool_call = before_tool_call
 
@@ -38,12 +38,21 @@ class Agent:
         self._state.isStreaming = True
         self._state.messages.extend(messages)
 
-        await Engine.run_stream(
+        await self._engine.run_stream(
             messages=self._state.messages,
             tools=self._state.tools,
             system_prompt=self._state.systemPrompt,
-            model_client=self._model_client,
-            convert_to_llm=convert_to_llm,
+            emit=self._process_event,
+            before_tool_call=self._before_tool_call,
+        )
+
+    async def continue_(self):
+        """从当前 state 继续，不添加新消息。用于重试/压缩后继续。"""
+        self._state.isStreaming = True
+        await self._engine.run_stream(
+            messages=self._state.messages,
+            tools=self._state.tools,
+            system_prompt=self._state.systemPrompt,
             emit=self._process_event,
             before_tool_call=self._before_tool_call,
         )

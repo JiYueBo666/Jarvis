@@ -24,7 +24,10 @@ class WriteFile(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
-        path = resolve_path(parameters["path"], self.workspace_root)
+        try:
+            path = resolve_path(parameters["path"], self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
         content = str(parameters.get("content", ""))
 
         try:

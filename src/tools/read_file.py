@@ -32,7 +32,10 @@ class ReadFile(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
-        path = resolve_path(parameters["path"], self.workspace_root)
+        try:
+            path = resolve_path(parameters["path"], self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
         if not path.is_file():
             return ToolResult(output=f"Error: file not found: {path}")
 

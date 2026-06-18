@@ -1,9 +1,8 @@
 import json
 
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 
 from src.data.messages import TextContent, ThinkingContent, ToolCallContent, Usage
-from src.providers.base import ModelResult
 from src.providers.errors import ProviderError
 
 
@@ -14,72 +13,7 @@ class ModelClient:
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self.last_completion_metadata: dict = {}
-
-    def complete(
-        self,
-        messages: list,
-        max_new_tokens: int,
-        tools: list | None = None,
-        **kwargs,
-    ) -> ModelResult:
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_new_tokens,
-        }
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
-
-        try:
-            response = self.client.chat.completions.create(**body)
-        except Exception as exc:
-            raise _to_provider_error(exc, self.model, self.base_url)
-
-        choice = response.choices[0]
-        message = choice.message
-        text = (message.content or "").strip()
-        reasoning_content = getattr(message, "reasoning_content", None) or None
-
-        tool_calls = None
-        if message.tool_calls:
-            tool_calls = []
-            for tc in message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-                tool_calls.append(
-                    {
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "args": args,
-                    }
-                )
-
-        usage = response.usage
-        cached_tokens = 0
-        if usage:
-            details = getattr(usage, "prompt_tokens_details", None)
-            if details:
-                cached_tokens = getattr(details, "cached_tokens", 0) or 0
-
-        self.last_completion_metadata = {
-            "model": self.model,
-            "usage": dict(usage or {}),
-            "finish_reason": choice.finish_reason or "",
-            "tool_calls_count": len(tool_calls) if tool_calls else 0,
-            "cached_tokens": cached_tokens,
-        }
-        return ModelResult(
-            text=text,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            metadata=dict(self.last_completion_metadata),
-        )
 
     async def stream_complete(
         self,
@@ -206,3 +140,19 @@ def _to_provider_error(exc: Exception, model: str, base_url: str) -> ProviderErr
         cause_type=type(exc).__name__,
         body_excerpt=str(exc)[:500],
     )
+
+
+# ── Context Window 注册表 ──────────────────────────────────
+
+_CONTEXT_WINDOWS = {
+    "deepseek-chat": 65536,
+    "deepseek-reasoner": 131072,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+}
+_DEFAULT_CONTEXT_WINDOW = 128000
+
+
+def get_context_window(model: str) -> int:
+    return _CONTEXT_WINDOWS.get(model, _DEFAULT_CONTEXT_WINDOW)

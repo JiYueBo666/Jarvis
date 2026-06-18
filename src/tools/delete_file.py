@@ -35,9 +35,12 @@ class DeleteFile(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResult:
-        path_str = str(parameters["path"])
-        recursive = bool(parameters.get("recursive", False))
-        target = resolve_path(path_str, self.workspace_root)
+        path_str = parameters["path"]
+        recursive = parameters.get("recursive", False)
+        try:
+            target = resolve_path(path_str, self.workspace_root)
+        except ValueError as e:
+            return ToolResult(output=f"Error: {e}")
 
         if not target.exists():
             return ToolResult(output=f"Error: path not found: {target}")

@@ -11,4 +11,5 @@ dependencies = [
     "prompt-toolkit>=3.0.52",
     "rich>=15.0.0",
     "typer>=0.26.4",
+    "loguru>=0.7.3",
 ]

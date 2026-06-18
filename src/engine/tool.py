@@ -30,6 +30,14 @@ class Tool(ABC):
         parameters = self.get_parameters()
         properties = {}
         required = []
+
+        # Inject intent as the first parameter — LLM fills this to explain the call
+        properties["intent"] = {
+            "type": "string",
+            "description": "Brief explanation of why this tool is being called (shown to user)",
+        }
+        required.append("intent")
+
         for p in parameters:
             properties[p.name] = {
                 "type": p.type,

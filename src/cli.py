@@ -22,9 +22,12 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 
 from src.AgentSession.agent_session import AgentSession
 from src.data.event import (
@@ -40,6 +43,7 @@ from src.data.event import (
 from src.data.messages import TextContent, ThinkingContent, ToolCallContent, Usage
 from src.engine.model import ModelClient
 from src.tools import build_registry
+from loguru import logger as log
 
 _reasoning_active = False
 
@@ -137,7 +141,8 @@ def _render_event(event):
                 print(flush=True)
 
     elif isinstance(event, ToolExecutionStart):
-        _tool_line(event.tool_name, _compact_args(event.args))
+        intent = event.args.get("intent", "")
+        _tool_line(event.tool_name, intent, _compact_args(event.args))
 
     elif isinstance(event, ToolExecutionEnd):
         # tool_result 消息的内容是 TextContent 列表
@@ -159,16 +164,21 @@ def _render_event(event):
             print(flush=True)
 
 
-def _tool_line(name: str, args_str: str):
-    print(f"  \033[36m⚙ {name}\033[0m(\033[33m{args_str}\033[0m)", flush=True)
+def _tool_line(name: str, intent: str, args_str: str):
+    if intent:
+        print(f"  \033[2m▶\033[0m \033[37m{intent}\033[0m", flush=True)
+    print(f"  \033[36m⚙ {name}\033[0m({args_str})" if args_str else f"  \033[36m⚙ {name}\033[0m", flush=True)
 
 
 def _handle_approval(event: ApprovalRequired):
     name = event.tool_name
+    intent = event.args.get("intent", "")
     args = _compact_args(event.args)
     print()
     print(f"  \033[33m┌─── 🛡️  审批请求 ───────────────────────────┐\033[0m")
-    print(f"  \033[33m│\033[0m  \033[1m{name}\033[0m(\033[33m{args}\033[0m)")
+    if intent:
+        print(f"  \033[33m│\033[0m  \033[37m▶ {intent}\033[0m")
+    print(f"  \033[33m│\033[0m  \033[1m{name}\033[0m({args})" if args else f"  \033[33m│\033[0m  \033[1m{name}\033[0m")
     print(f"  \033[33m│\033[0m  \033[2mY 允许本次  a 允许本轮  n 拒绝\033[0m")
     print(f"  \033[33m└────────────────────────────────────────────┘\033[0m")
     try:
@@ -196,6 +206,8 @@ def _dim(text: str):
 def _compact_args(args: dict) -> str:
     parts = []
     for k, v in args.items():
+        if k == "intent":
+            continue
         s = str(v)
         if len(s) > 80:
             s = s[:77] + "..."
@@ -221,14 +233,34 @@ def _print_help():
     print("    python main.py             新建会话")
 
 
-def bordered_prompt(history: FileHistory | None = None) -> str:
-    """Bordered input box matching cc-mini design.
+class SlashCommandCompleter(Completer):
+    _COMMANDS = {
+        "/exit": "退出程序",
+        "/quit": "退出程序",
+        "/help": "查看帮助",
+    }
 
-    Top:    ╭────────────────────────
-    Prompt: > user types here
-    Bottom: ╰─── Enter · Alt+Enter ──
-    """
-    import os
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor.lstrip()
+        if not text.startswith("/"):
+            return
+        query = text[1:].lower()
+        for cmd, desc in self._COMMANDS.items():
+            name = cmd[1:]
+            if not query or name.startswith(query):
+                yield Completion(
+                    cmd,
+                    start_position=-len(text),
+                    display=cmd,
+                    display_meta=desc,
+                )
+
+
+def bordered_prompt(
+    history: FileHistory | None = None,
+    completer: Completer | None = None,
+) -> str:
+    """Bordered input box with optional slash-command completer."""
 
     def _accept(b):
         get_app().exit(result=b.text)
@@ -236,21 +268,35 @@ def bordered_prompt(history: FileHistory | None = None) -> str:
 
     buf = Buffer(
         history=history,
+        completer=completer,
         complete_while_typing=False,
         accept_handler=_accept,
     )
 
+    def _auto_complete():
+        if buf.text.lstrip().startswith("/"):
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loop.call_soon(lambda: buf.start_completion(select_first=False))
+            except RuntimeError:
+                pass
+
+    buf.on_text_changed += lambda _: _auto_complete()
+
     def _top():
+        import os as _os
         try:
-            w = os.get_terminal_size().columns
+            w = _os.get_terminal_size().columns
         except OSError:
             w = 80
         fill = "\u2500" * max(0, w - 2)
         return [("bold fg:ansicyan", f"\u256d{fill}")]
 
     def _bot():
+        import os as _os
         try:
-            w = os.get_terminal_size().columns
+            w = _os.get_terminal_size().columns
         except OSError:
             w = 80
         hints = "\u2500 Enter \u00b7 Alt+Enter \u00b7 /help "
@@ -262,17 +308,26 @@ def bordered_prompt(history: FileHistory | None = None) -> str:
             return [("bold fg:ansicyan", "> ")]
         return [("", "  ")]
 
-    body = HSplit([
-        Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
-        Window(
-            BufferControl(buffer=buf),
-            get_line_prefix=_line_prefix,
-            height=Dimension(min=1),
-            dont_extend_height=True,
-            wrap_lines=True,
-        ),
-        Window(FormattedTextControl(_bot), dont_extend_height=True),
-    ])
+    body = FloatContainer(
+        content=HSplit([
+            Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
+            Window(
+                BufferControl(buffer=buf),
+                get_line_prefix=_line_prefix,
+                height=Dimension(min=1),
+                dont_extend_height=True,
+                wrap_lines=True,
+            ),
+            Window(FormattedTextControl(_bot), dont_extend_height=True),
+        ]),
+        floats=[
+            Float(
+                xcursor=True,
+                ycursor=True,
+                content=CompletionsMenu(max_height=8, scroll_offset=1),
+            ),
+        ],
+    )
 
     kb = KeyBindings()
 
@@ -302,7 +357,29 @@ def bordered_prompt(history: FileHistory | None = None) -> str:
     return app.run()
 
 
+slash_completer = SlashCommandCompleter()
+
+
+def _handle_command(query: str) -> str | None:
+    """Handle slash commands. Returns 'exit', 'handled', or None."""
+    if not query.startswith("/"):
+        return None
+    parts = query.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    if cmd in ("/exit", "/quit"):
+        return "exit"
+    if cmd == "/help":
+        _print_help()
+        return "handled"
+    _dim(f"未知命令：{cmd}，输入 /help 查看可用命令")
+    return "handled"
+
+
 def main():
+    log.remove()
+    log.add(sys.stderr, format="<dim>{time:HH:mm:ss}</dim> | <level>{message}</level>", colorize=True)
+    log.add(".jarvis/logs/{time:YYYY-MM-DD}.log", rotation="1 day", retention=7, level="DEBUG")
+
     workspace = os.getcwd()
     model = os.environ.get("LLM_MODEL", os.environ.get("MODEL", "deepseek-chat"))
     base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("BASE_URL", "https://api.deepseek.com/v1"))
@@ -330,7 +407,7 @@ def main():
 
     while True:
         try:
-            query = bordered_prompt(history=file_history)
+            query = bordered_prompt(history=file_history, completer=slash_completer)
             query = query.strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -338,10 +415,11 @@ def main():
 
         if not query:
             continue
-        if query in ("/exit", "/quit"):
+
+        cmd_result = _handle_command(query)
+        if cmd_result == "exit":
             break
-        if query == "/help":
-            _print_help()
+        if cmd_result:
             continue
         spinner: Spinner | None = None
         prompt_tok = 0

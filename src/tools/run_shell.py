@@ -1,10 +1,37 @@
 from pathlib import Path
 from typing import Any
 
-from src.config import settings
 from src.engine.tool import Tool, ToolParameter
-from src.guard.sandbox import SandboxConfig, SandboxMode, SandboxRunner
 from src.tools.base import ToolResult
+
+# stubs for deferred sandbox — sandbox/guard isn't implemented yet
+class SandboxConfig:
+    def __init__(self, mode: str = "best_effort", workspace_root: str = "/tmp"):
+        self.mode = mode
+        self.workspace_root = workspace_root
+
+
+class SandboxRunner:
+    def __init__(self, config: SandboxConfig):
+        self._config = config
+
+    def run(self, command: str, timeout: int = 30) -> ToolResult:
+        import subprocess
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=self._config.workspace_root,
+            )
+            output = result.stdout + result.stderr
+            return ToolResult(output=output)
+        except subprocess.TimeoutExpired:
+            return ToolResult(output=f"Command timed out after {timeout}s")
+        except Exception as e:
+            return ToolResult(output=str(e))
 
 
 class RunShell(Tool):
@@ -21,10 +48,11 @@ class RunShell(Tool):
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else Path.cwd()
 
         # ── 初始化沙箱执行器 ────────────────────────────────────
-        sandbox_mode = SandboxMode(settings.SANDBOX_MODE)
+        from src.config import settings
+        mode = settings.SANDBOX_MODE
         self._sandbox = SandboxRunner(
             SandboxConfig(
-                mode=sandbox_mode,
+                mode=mode,
                 workspace_root=str(self.workspace_root),
             )
         )

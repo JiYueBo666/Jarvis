@@ -1,369 +1,461 @@
-"""
-AgentSession — 核心全局调度器。
-
-职责：
-  - 用户输入预处理（斜杠命令、skill 展开）
-  - 模型 / API key 验证
-  - 上下文压缩（compaction）
-  - 错误重试 + 指数退避
-  - 消息持久化
-  - 事件广播给 UI 订阅者
-"""
-
-from __future__ import annotations
-
 import asyncio
-from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+import os
+import subprocess
+import time
+from typing import Callable, Literal
 
-from src.Agent.agent import CodingAgent
-from src.Agent.loop import AgentLoopConfig
-from src.Client.base import convert_to_llm
-from src.Agent.models import Message as InternalMessage
-from src.Client.base import StreamEvent
-from src.Client.openai import OpenAIClient
-from src.Sessions.session_manager import SessionManager
-from src.Tools.base import Tool, ToolExecutor, ToolRegistry
-from src.Tools.builtin import ReadFileTool, RunShellTool, SearchCodeTool, WriteFileTool
+from src.context.session_manager import SessionManager
+from src.Agent.agent import Agent
+from src.data.event import (
+    AgentEnd,
+    AgentEvent,
+    ApprovalRequired,
+    CompactionEnd,
+    CompactionStart,
+    RetryEnd,
+    RetryStart,
+)
+from src.data.messages import (
+    AssistantMessage,
+    CompactionSummaryMessage,
+    ToolCallContent,
+    ToolResultMessage,
+    UserMessage,
+    TextContent,
+    ThinkingContent,
+)
+from src.engine.model import ModelClient, get_context_window
+from src.engine.tool import Tool
+from loguru import logger as log
 
-# ── 内置工具映射 ───────────────────────────────────
 
-_BUILTIN_TOOLS: dict[str, type[Tool]] = {
-    "read_file": ReadFileTool,
-    "write_file": WriteFileTool,
-    "run_shell": RunShellTool,
-    "search_code": SearchCodeTool,
-}
-
-
-# ── AgentSession ──────────────────────────────────
+def _git_output(cmd: str) -> str:
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 class AgentSession:
-    """顶层编排层：处理输入、调度 Agent、管理生命周期。"""
-
     def __init__(
         self,
-        config: AgentLoopConfig,
-        executor: ToolExecutor,
-        session_manager: SessionManager | None = None,
-        agent: CodingAgent | None = None,
+        model_client,
+        system_prompt: str,
+        tools: list[Tool] | None = None,
+        approval: Literal["auto", "ask", "never"] = "ask",
+        session_manager: SessionManager = None,
     ):
-        self.config = config
-        self.executor = executor
-        self.session_manager = session_manager or SessionManager()
-        self.agent = agent or CodingAgent(config=config, executor=executor)
+        self.tools = tools
+        self.model_client = model_client
+        self._session_manager = session_manager
+        self._session_id = session_manager.new_session_id() if session_manager else ""
+        self._agent = Agent(model_client, before_tool_call=self._before_tool_call)
+        self._agent._state.systemPrompt = system_prompt
+        self._agent._state.tools = tools or []
+        self._tool_map = {tool.name: tool for tool in (tools or [])}
+        self.approval: Literal["auto", "ask", "never"] = approval
 
-        # 当前激活的工具名列表
-        self._tool_registry = ToolRegistry()
-        self._active_tool_names: list[str] = ["read_file", "search_code"]
-        self._init_tools()
+        self._ui_listeners: set = set()
+        self._unsub = self._agent.subscribe(self._handle_event)
 
-        # 重试
-        self._retry_attempts = 0
-        self._max_retries = 3
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
-        # UI 订阅者
-        self._subscribers: list[Callable[[StreamEvent], Awaitable[None]]] = []
+    @property
+    def state(self):
+        return self._agent._state
 
-        # 上下文压缩
-        self._compaction_threshold = 50_000  # 超过此 token 数触发压缩
-        self._compacted = False
+    async def prompt(self, query: str):
+        self._agent._state.systemPrompt = self._build_system_prompt()
 
-    # ── 订阅 ────────────────────────────────────────
+        if self._agent._state.isStreaming:
+            raise RuntimeError("Agent is already processing")
+        msg = UserMessage(
+            role="user",
+            content=[TextContent(text=query)],
+            timestamp=int(time.time()),
+        )
+        await self._run_agent([msg])
 
-    def subscribe(self, fn: Callable[[StreamEvent], Awaitable[None]]) -> None:
-        """注册 UI 订阅者，收到消息广播。"""
-        self._subscribers.append(fn)
+    # ── 重试 & Compaction ──────────────────────────────────────
 
-    def unsubscribe(self, fn: Callable[[StreamEvent], Awaitable[None]]) -> None:
-        if fn in self._subscribers:
-            self._subscribers.remove(fn)
+    async def _run_agent(self, messages: list):
+        """启动 agent，然后在 while 循环里检查重试/压缩直到不需要处理。"""
+        await self._agent.prompt(messages)
+        while await self._handle_after():
+            pass
 
-    async def _emit(self, event: StreamEvent) -> None:
-        """广播事件给所有 UI 订阅者。"""
-        for sub in self._subscribers:
-            try:
-                await sub(event)
-            except Exception:
-                pass
+    async def _handle_after(self) -> bool:
+        """Agent run 结束后检查：可重试错误 → 重试；超限 → 压缩。
+        Returns True 表示做了处理需要重新检查。"""
+        from src.config import settings
 
-    # ── 工具管理 ────────────────────────────────────
-
-    def _init_tools(self) -> None:
-        """注册所有内置工具并设置初始激活工具。"""
-        for cls in _BUILTIN_TOOLS.values():
-            self._tool_registry.register(cls())
-        self.set_active_tools_by_name(self._active_tool_names)
-
-    def set_active_tools_by_name(self, names: list[str]) -> None:
-        """启用指定工具列表，更新 system prompt。"""
-        self._active_tool_names = list(names)
-        tools: list[Tool] = []
-        for name in names:
-            cls = _BUILTIN_TOOLS.get(name)
-            if cls:
-                tools.append(cls())
-        self.agent.state.tools = tools
-
-    def get_active_tool_names(self) -> list[str]:
-        return list(self._active_tool_names)
-
-    def get_tool_definition(self, name: str) -> Tool | None:
-        cls = _BUILTIN_TOOLS.get(name)
-        return cls() if cls else None
-
-    # ── 入口 ────────────────────────────────────────
-
-    async def prompt(
-        self,
-        user_input: str,
-        approval_check: Callable[[str, dict], Awaitable[bool]] | None = None,
-    ) -> str | None:
-        """用户输入入口。返回最终响应内容，或 None（skipped）。"""
-
-        # 1. 检查斜杠命令
-        if user_input.startswith("/"):
-            return await self._handle_command(user_input)
-
-        # 2. 验证配置
-        if not self._validate_config():
-            err = "API key 或模型未配置"
-            await self._emit(StreamEvent("error", data=err))
-            return err
-
-        # 3. 检查是否需要压缩
-        await self._check_compaction()
-
-        # 4. 持久化用户消息
-        self._persist_message("user", user_input)
-
-        # 5. 调度 Agent
-        return await self._run_agent_prompt(user_input, approval_check=approval_check)
-
-    # ── 斜杠命令 ───────────────────────────────────
-
-    async def _handle_command(self, cmd: str) -> str | None:
-        parts = cmd.strip().split(maxsplit=1)
-        command = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
-
-        match command:
-            case "/clear":
-                self.agent.state.messages.clear()
-                await self._emit(
-                    StreamEvent(
-                        "message_end",
-                        message=InternalMessage(
-                            role="assistant",
-                            content="会话已清空",
-                        ),
-                    )
-                )
-                return "会话已清空"
-
-            case "/tools":
-                names = ", ".join(self._active_tool_names)
-                text = f"当前工具: {names}"
-                await self._emit(
-                    StreamEvent(
-                        "message_end",
-                        message=InternalMessage(
-                            role="assistant",
-                            content=text,
-                        ),
-                    )
-                )
-                return text
-
-            case "/tool_on":
-                if arg:
-                    self.set_active_tools_by_name([arg])
-                return f"工具 [{arg}] 已启用"
-
-            case "/retry":
-                # 重用状态中的最后一条用户消息
-                last_user = None
-                for msg in reversed(self.agent.state.messages):
-                    if msg.role == "user" and msg.content:
-                        last_user = msg.content
-                        break
-                return (
-                    await self._run_agent_prompt(last_user or "")
-                    if last_user
-                    else "没有可重试的消息"
-                )
-
-            case "/help":
-                help_text = (
-                    "/clear  清空对话历史\n"
-                    "/tools  查看当前工具列表\n"
-                    "/retry  重试上一次请求\n"
-                    "/help   显示帮助"
-                )
-                await self._emit(
-                    StreamEvent(
-                        "message_end",
-                        message=InternalMessage(
-                            role="assistant",
-                            content=help_text,
-                        ),
-                    )
-                )
-                return help_text
-
-            case _:
-                return None
-
-    # ── 验证 ────────────────────────────────────────
-
-    def _validate_config(self) -> bool:
-        if not self.config.api_key:
+        msg = self._last_assistant_message()
+        if not msg:
             return False
-        if not self.config.model:
+
+        # 1. 可重试错误（rate limit, 500 等）→ 退避重试
+        if self._is_retryable_error(msg):
+            await self._emit_ui(RetryStart())
+            if await self._prepare_retry(msg):
+                await self._agent.continue_()
+                self._retry_attempt = 0
+                await self._emit_ui(RetryEnd(success=True))
+                return True
+            await self._emit_ui(RetryEnd(success=False))
             return False
+
+        # 2. 上下文超限 → 压缩后继续
+        if settings.COMPACTION_ENABLED and self._check_compaction(msg):
+            await self._emit_ui(CompactionStart())
+            msgs_before = len(self._agent._state.messages)
+            await self._run_auto_compaction()
+            msgs_after = len(self._agent._state.messages)
+            await self._emit_ui(CompactionEnd(msgs_before, msgs_after))
+            await self._agent.continue_()
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_retryable_error(message: AssistantMessage) -> bool:
+        if message.stop_reason != "error" or not message.error_message:
+            return False
+
+        err = message.error_message.lower()
+
+        overflow_patterns = (
+            "context length",
+            "maximum context",
+            "too many tokens",
+            "token limit",
+        )
+        if any(p in err for p in overflow_patterns):
+            return False
+
+        retryable_patterns = [
+            "overloaded",
+            "provider returned error",
+            "rate limit",
+            "too many requests",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "service unavailable",
+            "server error",
+            "internal error",
+            "network error",
+            "connection error",
+            "connection refused",
+            "connection lost",
+            "websocket closed",
+            "fetch failed",
+            "socket hang up",
+            "timeout",
+            "terminated",
+        ]
+        return any(p in err for p in retryable_patterns)
+
+    def _last_assistant_message(self) -> AssistantMessage | None:
+        for msg in reversed(self._agent._state.messages):
+            if isinstance(msg, AssistantMessage):
+                return msg
+        return None
+
+    async def _prepare_retry(self, msg: AssistantMessage) -> bool:
+        """移除最后一条错误消息，指数退避后返回 True 表示可以重试。"""
+        msgs = self._agent._state.messages
+        if msgs and msgs[-1] is msg:
+            msgs.pop()
+        else:
+            for i in range(len(msgs) - 1, -1, -1):
+                if (
+                    isinstance(msgs[i], AssistantMessage)
+                    and msgs[i].stop_reason == "error"
+                ):
+                    msgs.pop(i)
+                    break
+
+        self._retry_attempt = getattr(self, "_retry_attempt", 0) + 1
+        if self._retry_attempt > 3:
+            log.warning(f"Max retries ({3}) reached, giving up")
+            return False
+
+        delay = min(1.0 * (2 ** (self._retry_attempt - 1)), 30.0)
+        log.info(f"Retry attempt {self._retry_attempt}, waiting {delay:.1f}s")
+        await asyncio.sleep(delay)
         return True
 
-    # ── 压缩 ────────────────────────────────────────
+    @staticmethod
+    def _is_context_overflow(msg: AssistantMessage) -> bool:
+        if msg.stop_reason != "error" or not msg.error_message:
+            return False
+        err = msg.error_message.lower()
+        patterns = (
+            "context length",
+            "maximum context",
+            "too many tokens",
+            "token limit",
+        )
+        return any(p in err for p in patterns)
 
-    async def _check_compaction(self) -> None:
-        """估算 token 数，超过阈值时生成摘要并替换历史。"""
-        total = self._estimate_tokens(self.agent.state.messages)
-        if total < self._compaction_threshold:
+    @staticmethod
+    def _should_compact(input_tokens: int, ctx_window: int) -> bool:
+        from src.config import settings
+
+        return input_tokens > ctx_window - settings.COMPACTION_RESERVE_TOKENS
+
+    def _check_compaction(self, msg: AssistantMessage) -> bool:
+        ctx_window = get_context_window(self.model_client.model)
+        if self._is_context_overflow(msg):
+            return True
+        usage = getattr(msg, "usage", None)
+        if usage:
+            if usage.input_tokens > ctx_window:
+                return True
+            if self._should_compact(usage.input_tokens, ctx_window):
+                return True
+        return False
+
+    @staticmethod
+    def _select_cut_point(messages: list) -> int | None:
+        last_asst_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], AssistantMessage):
+                last_asst_idx = i
+                break
+        if last_asst_idx is None:
+            return None
+
+        tool_ids = {
+            block.id
+            for block in messages[last_asst_idx].content
+            if isinstance(block, ToolCallContent)
+        }
+
+        last_keep_idx = last_asst_idx
+        for i in range(last_asst_idx + 1, len(messages)):
+            if (
+                isinstance(messages[i], ToolResultMessage)
+                and messages[i].tool_call_id in tool_ids
+            ):
+                last_keep_idx = i
+
+        cut = last_keep_idx
+        for i in range(last_keep_idx - 1, -1, -1):
+            if not isinstance(messages[i], CompactionSummaryMessage):
+                cut = i + 1
+                break
+        else:
+            cut = 0
+
+        if cut < 2:
+            return None
+        return cut
+
+    async def _generate_summary(self, messages: list) -> str:
+        lines = []
+        for m in messages:
+            role = m.role
+            text_parts = []
+            for block in getattr(m, "content", []) or []:
+                if isinstance(block, TextContent):
+                    text_parts.append(block.text)
+                elif isinstance(block, ThinkingContent):
+                    text_parts.append(f"[thinking]{block.thinking}[/thinking]")
+                elif isinstance(block, ToolCallContent):
+                    text_parts.append(f"[tool_call: {block.name}({block.arguments})]")
+            if isinstance(m, ToolResultMessage):
+                result_text = "".join(
+                    c.text for c in m.content if isinstance(c, TextContent)
+                )
+                text_parts.append(f"[tool_result: {result_text[:200]}]")
+            if text_parts:
+                lines.append(f"{role}: {' '.join(text_parts)}")
+
+        summary_prompt = (
+            "Summarize the following conversation concisely. "
+            "Preserve all facts, decisions, file paths, and code references.\n\n"
+            + "\n".join(lines)
+        )
+        llm_messages = [
+            {"role": "system", "content": "You are a conversation summarizer."},
+            {"role": "user", "content": summary_prompt},
+        ]
+
+        for _ in range(2):
+            try:
+                text_parts = []
+                async for block in self.model_client.stream_complete(
+                    llm_messages, max_new_tokens=1024, tools=None
+                ):
+                    if isinstance(block, TextContent):
+                        text_parts.append(block.text)
+                return "".join(text_parts)
+            except Exception as e:
+                log.warning(f"Summary generation failed: {e}")
+                continue
+        return ""
+
+    async def _run_auto_compaction(self):
+        msgs = self._agent._state.messages
+        cut = self._select_cut_point(msgs)
+        if cut is None or cut < 1:
+            log.warning("Compaction skipped: no safe cut point found")
             return
 
-        # 保留 system prompt + 最近 N 轮 + 当前
-        keep_last = 4
-        if len(self.agent.state.messages) > keep_last:
-            summary_parts = self.agent.state.messages[:-keep_last]
-            recent = self.agent.state.messages[-keep_last:]
+        to_compress = msgs[:cut]
+        to_keep = msgs[cut:]
 
-            summary_text = await self._generate_summary(summary_parts)
-            summary_msg = InternalMessage(
-                role="system",
-                content=f"[上下文摘要]:\n{summary_text}",
-            )
-            self.agent.state.messages = [summary_msg] + recent
-            self._compacted = True
+        log.info(f"Compacting {len(to_compress)} messages...")
+        summary = await self._generate_summary(to_compress)
+        if not summary:
+            log.warning("Compaction skipped: summary generation failed")
+            return
 
-            await self._emit(
-                StreamEvent(
-                    "message_end",
-                    message=InternalMessage(
-                        role="assistant",
-                        content=f"📐 上下文已压缩，生成了 {len(summary_text)} 字符的摘要",
-                    ),
-                )
-            )
+        tokens_before = sum(
+            m.usage.input_tokens for m in to_compress if hasattr(m, "usage") and m.usage
+        )
 
-    def _estimate_tokens(self, messages: list[InternalMessage]) -> int:
-        """粗略估算 token 数量。"""
-        total = 0
+        summary_msg = CompactionSummaryMessage(
+            summary=summary,
+            tokens_before=tokens_before,
+        )
+
+        self._agent._state.messages = [summary_msg] + to_keep
+        log.info(
+            f"Compaction done: {len(to_compress)} -> 1 summary, {len(to_keep)} kept"
+        )
+
+    async def _emit_ui(self, event):
+        for listener in self._ui_listeners:
+            result = listener(event)
+            if asyncio.iscoroutine(result):
+                await result
+
+    def load_session(self, session_id: str) -> bool:
+        """Restore messages from a previous session. Returns False if not found."""
+        if not self._session_manager:
+            return False
+        msgs = self._session_manager.load(session_id)
+        if msgs is None:
+            return False
+        self._agent._state.messages = msgs
+        self._session_id = session_id
+        return True
+
+    def list_sessions(self):
+        """列出所有已保存的会话。"""
+        if not self._session_manager:
+            return []
+        return self._session_manager.list_sessions()
+
+    async def _handle_event(self, event: AgentEvent):
+        if isinstance(event, AgentEnd) and self._session_manager:
+            merged = self._merge_messages(self._agent._state.messages)
+            self._session_manager.save(self._session_id, merged)
+
+        for listener in self._ui_listeners:
+            result = listener(event)
+            if asyncio.iscoroutine(result):
+                await result
+
+    @staticmethod
+    def _merge_messages(messages: list) -> list:
+        """合并消息中相邻同类型的 content block（stream 碎片 → 完整块）。"""
+        from src.data.messages import AssistantMessage, TextContent, ThinkingContent
+
+        out = []
         for msg in messages:
-            if msg.content:
-                total += len(msg.content)
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    total += len(tc.name) + len(str(tc.arguments))
-        return total
+            if not isinstance(msg, AssistantMessage):
+                out.append(msg)
+                continue
+            merged = []
+            for block in getattr(msg, "content", []) or []:
+                if (
+                    isinstance(block, (TextContent, ThinkingContent))
+                    and merged
+                    and isinstance(block, type(merged[-1]))
+                ):
+                    prev = merged[-1]
+                    if isinstance(block, ThinkingContent):
+                        prev.thinking += block.thinking
+                    else:
+                        prev.text += block.text
+                else:
+                    merged.append(block)
+            msg.content = merged
+            out.append(msg)
+        return out
 
-    async def _generate_summary(self, messages: list[InternalMessage]) -> str:
-        """用 LLM 为历史消息生成摘要。"""
-        texts = []
-        for m in messages:
-            if m.content:
-                texts.append(f"[{m.role}] {m.content[:500]}")
-        if not texts:
-            return ""
-
-        prompt = (
-            "请总结以下对话历史的关键信息（技术决策、已解决的问题、当前状态）：\n\n"
-            + "\n".join(texts[-20:])
-        )
-
-        try:
-            client = self.config.client
-            resp = await client.chat([InternalMessage(role="user", content=prompt)])
-            return resp.content or "(摘要生成失败)"
-        except Exception:
-            return "(摘要生成失败)"
-
-    # ── Agent 调度 ─────────────────────────────────
-
-    async def _run_agent_prompt(
-        self, user_input: str,
-        approval_check: Callable[[str, dict], Awaitable[bool]] | None = None,
-    ) -> str | None:
-        """调用 Agent，带重试逻辑。"""
-        self._retry_attempts = 0
-
-        # 桥接：CodingAgent._listeners → AgentSession._subscribers
-        async def _bridge(event: StreamEvent) -> None:
-            await self._emit(event)
-        self.agent.add_listener(_bridge)
-
-        try:
-            while self._retry_attempts < self._max_retries:
-                try:
-                    self.agent.state.reset_runtime()
-                    msg_count = len(self.agent.state.messages)
-                    result = await self.agent.prompt(user_input, approval_check=approval_check)
-
-                    if result:
-                        self._persist_message("assistant", result)
-
-                    self._retry_attempts = 0
-                    return result
-
-                except Exception as e:
-                    # 恢复消息长度（prompt() 可能已添加用户消息）
-                    if len(self.agent.state.messages) > msg_count:
-                        del self.agent.state.messages[msg_count:]
-                    self._retry_attempts += 1
-                    err = f"请求失败 (第 {self._retry_attempts} 次): {e}"
-                    await self._emit(StreamEvent("error", data=err))
-
-                    if self._retry_attempts >= self._max_retries:
-                        return err
-
-                    wait = 2 ** (self._retry_attempts - 1)
-                    await asyncio.sleep(wait)
-        finally:
-            self.agent.remove_listener(_bridge)
-
-    # ── 持久化 ──────────────────────────────────────
-
-    def _persist_message(self, role: str, content: str) -> None:
-        self.session_manager.append(
-            {
-                "role": role,
-                "content": content,
-                "time": datetime.now(timezone.utc).isoformat(),
-                "model": self.config.model,
+    async def _before_tool_call(self, tool_name: str, args: dict) -> dict:
+        """工具执行前审批 hook。返回 {"approved": bool, "message": str}。"""
+        if self.approval == "auto":
+            return {"approved": True}
+        if self.approval == "never":
+            return {
+                "approved": False,
+                "message": f"Tool '{tool_name}' denied by 'never' policy",
             }
+
+        # ask mode
+        tool = self._tool_map.get(tool_name)
+        if tool and not tool.risky:
+            return {"approved": True}
+
+        future = asyncio.get_event_loop().create_future()
+        await self._handle_event(
+            ApprovalRequired(tool_name=tool_name, args=args, _future=future)
+        )
+        return await future
+
+    def dispose(self):
+        self._unsub()
+        self._ui_listeners.clear()
+
+    def subscribe(self, listener):
+        self._ui_listeners.add(listener)
+        return lambda: self._ui_listeners.discard(listener)
+
+    def _build_system_prompt(self):
+        fix_prompt = self.build_prefix()
+
+        current_branch = _git_output("git rev-parse --abbrev-ref HEAD") or "unknown"
+
+        descriptions = "\n".join(f"- {t.name}" for t in self.tools)
+
+        return (
+            f"{fix_prompt}\n"
+            f"Current branch: {current_branch}\n\n"
+            f"# Tool-use ability\n"
+            f"You can use tools to finish the task:\n"
+            f"{descriptions}\n"
         )
 
-    # ── 重建 Agent ─────────────────────────────────
+    def build_prefix(self):
+        cwd = os.getcwd()
+        git_scope = _git_output("git rev-parse --show-toplevel") or cwd
 
-    @classmethod
-    def create(
-        cls,
-        api_key: str,
-        base_url: str = "https://api.openai.com/v1",
-        model: str = "gpt-4o",
-        session_dir: str | None = None,
-    ) -> AgentSession:
-        """便捷工厂方法。"""
-        client = OpenAIClient(api_key=api_key, base_url=base_url, model=model)
-        registry = ToolRegistry(Tool.collect())
-        executor = ToolExecutor(registry)
+        main_branch_raw = _git_output("git symbolic-ref refs/remotes/origin/HEAD")
+        if main_branch_raw.startswith("refs/remotes/origin/"):
+            main_branch = main_branch_raw[len("refs/remotes/origin/") :]
+        else:
+            main_branch = "main"
 
-        config = AgentLoopConfig(
-            model=model,
-            api_key=api_key,
-            client=client,
-            convert_to_llm=convert_to_llm,
+        return (
+            f"You are Jarvis, a powerful AI coding Agent running in {cwd}.\n"
+            f"\n"
+            f"# Rules\n"
+            f"1. Before starting the task, make sure you have a thorough understanding of the project.\n"
+            f"2. When the user rejects a tool call and you do not understand why, you can ask the user for clarification.\n"
+            f"\n"
+            f"# Environment\n"
+            f"Git scope: {git_scope}\n"
+            f"Main branch: {main_branch}\n"
         )
-
-        session_mgr = SessionManager(session_dir)
-        return cls(config=config, executor=executor, session_manager=session_mgr)

@@ -28,11 +28,15 @@ class AgentState:
 
 
 class Agent:
-    def __init__(self, model_client: ModelClient, before_tool_call=None):
+    def __init__(
+        self, model_client: ModelClient, before_tool_call=None, after_tool_call=None
+    ):
+
         self._state = AgentState()
         self._engine = Engine(model_client=model_client, convert_to_llm=convert_to_llm)
         self._listeners: set = set()
         self._before_tool_call = before_tool_call
+        self._after_tool_call = after_tool_call
 
     async def prompt(self, messages: list[AgentMessage]):
         self._state.isStreaming = True
@@ -44,6 +48,7 @@ class Agent:
             system_prompt=self._state.systemPrompt,
             emit=self._process_event,
             before_tool_call=self._before_tool_call,
+            after_tool_call=self._after_tool_call,
         )
 
     async def continue_(self):
@@ -55,6 +60,7 @@ class Agent:
             system_prompt=self._state.systemPrompt,
             emit=self._process_event,
             before_tool_call=self._before_tool_call,
+            after_tool_call=self._after_tool_call,
         )
 
     async def _emit(self, event):

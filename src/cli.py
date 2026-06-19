@@ -31,8 +31,8 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
 from src.AgentSession.agent_session import AgentSession
-from src.config import settings
 from src.context.session_manager import SessionManager
+from src.TaskManager import TaskManager
 from src.data.event import (
     AgentEnd,
     ApprovalRequired,
@@ -521,22 +521,32 @@ def main():
     )
 
     workspace = os.getcwd()
-    model = settings.SPEED_MODEL
-    base_url = settings.BASE_URL
-    api_key = settings.API_KEY
+    model = os.environ.get("LLM_MODEL", os.environ.get("MODEL", "deepseek-chat"))
+    base_url = os.environ.get(
+        "OPENAI_BASE_URL", os.environ.get("BASE_URL", "https://api.deepseek.com/v1")
+    )
+    api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("API_KEY", ""))
 
     model_client = ModelClient(model=model, base_url=base_url, api_key=api_key)
     system_prompt = "你是一个 helpful 的编程助手。"
     tools = list(build_registry(workspace_root=workspace).values())
     session_mgr = SessionManager(Path(workspace) / ".jarvis" / "sessions")
+
+    _print_banner(model, workspace)
+
+    task_mgr = TaskManager(str(Path(workspace) / ".jarvis" / "tasks"))
+
+    def _on_tool_result(name, args, result):
+        files = getattr(result, "metadata", {}).get("affected_paths", [])
+        task_mgr.record_tool(name, affected_files=files)
+
     session = AgentSession(
         model_client=model_client,
         system_prompt=system_prompt,
         tools=tools,
         session_manager=session_mgr,
+        on_tool_result=_on_tool_result,
     )
-
-    _print_banner(model, workspace)
 
     history_path = Path(workspace) / ".jarvis" / ".cli_history"
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -567,6 +577,8 @@ def main():
             break
         if cmd_result:
             continue
+
+        task_mgr.record_task(query)
         spinner: Spinner | None = None
         prompt_tok = 0
         completion_tok = 0
@@ -616,6 +628,7 @@ def main():
                     cached_tok += usage.cache_read_tokens
 
                 if isinstance(event, AgentEnd):
+                    task_mgr.finish("completed")
                     break
 
             future.result(timeout=5)

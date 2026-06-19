@@ -47,12 +47,18 @@ class AgentSession:
         tools: list[Tool] | None = None,
         approval: Literal["auto", "ask", "never"] = "ask",
         session_manager: SessionManager = None,
+        on_tool_result: Callable[[str, dict, object], None] | None = None,
     ):
         self.tools = tools
         self.model_client = model_client
         self._session_manager = session_manager
         self._session_id = session_manager.new_session_id() if session_manager else ""
-        self._agent = Agent(model_client, before_tool_call=self._before_tool_call)
+        self._on_tool_result = on_tool_result
+        self._agent = Agent(
+            model_client,
+            before_tool_call=self._before_tool_call,
+            after_tool_call=self._after_tool_call,
+        )
         self._agent._state.systemPrompt = system_prompt
         self._agent._state.tools = tools or []
         self._tool_map = {tool.name: tool for tool in (tools or [])}
@@ -414,6 +420,11 @@ class AgentSession:
             ApprovalRequired(tool_name=tool_name, args=args, _future=future)
         )
         return await future
+
+    def _after_tool_call(self, tool_name: str, args: dict, result):
+        """工具执行后回调。转发给外部 listener（如 TaskManager）。"""
+        if self._on_tool_result:
+            self._on_tool_result(tool_name, args, result)
 
     def dispose(self):
         self._unsub()

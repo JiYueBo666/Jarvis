@@ -48,6 +48,7 @@ class Engine:
         messages: list,
         emit: Callable,
         before_tool_call: Callable | None = None,
+        after_tool_call: Callable | None = None,
         max_steps: int = 100,
     ):
         steps = 0
@@ -117,6 +118,8 @@ class Engine:
                         output_text = (
                             str(output) if not isinstance(output, str) else output
                         )
+                        if after_tool_call:
+                            after_tool_call(tc.name, tc.arguments, output)
                     else:
                         output_text = f"error: unknown tool: {tc.name}"
                 else:
